@@ -532,6 +532,17 @@ process_queue_item() {
         return 1
     }
 
+    # 队列内容来自 resource_check.sh；在进行任何远端操作前仍要确认关键
+    # 数值和集数格式，避免手工改库或损坏记录导致错误替换。
+    [[ "$episode" =~ ^S[0-9]{2}E[0-9]{2,4}$ ]] || {
+        error "queue=$qid 集数格式无效：$episode"
+        return 1
+    }
+    [[ "$old_size" =~ ^[0-9]+$ ]] && [[ "$new_size" =~ ^[0-9]+$ ]] || {
+        error "queue=$qid 文件大小无效：old=${old_size:-empty} new=${new_size:-empty}"
+        return 1
+    }
+
     case "$target" in
         /kuake|/kuake/*) ;;
         *)
@@ -599,6 +610,14 @@ process_queue_item() {
         return 1
     }
 
+    # resource_check.sh 入队时以 old_filename + old_size 标识待替换文件。
+    # 执行前若该快照已变化，不能再沿用旧的收益判断；交给下一轮重新扫描并
+    # 生成新队列，避免覆盖外部刚更新的同名文件。
+    [ "$old_size_actual" = "$old_size" ] || {
+        error "待替换旧文件已变化，拒绝使用过期队列：$old_filename queued=$old_size actual=$old_size_actual"
+        return 1
+    }
+
     # replace_queue 已经由 resource_check 判定过，这里只做执行层防篡改保护。
     [ "$new_size" -gt "$old_size_actual" ] || {
         error "队列中的新文件不大于旧文件，拒绝执行：old=$old_size_actual new=$new_size"
@@ -616,12 +635,15 @@ process_queue_item() {
         return 1
     }
 
-    source_line="$(awk -F '\t' -v n="$source_file" '$1==n && ($4+0)>0{print;exit}' "$source_tmp")"
+    # source_check.sh 写入队列的是文件名而不是递归路径。分享中可能有
+    # 同名文件，因此同时匹配入队时的大小，不能仅取扫描结果中的第一个。
+    # 大小不一致意味着缓存已经过期，保守地让本次任务失败而非替换错文件。
+    source_line="$(awk -F '\t' -v n="$source_file" -v s="$new_size" '$1==n && $4==s && ($4+0)>0{print;exit}' "$source_tmp")"
 
     if [ -z "$source_line" ]; then
         local source_base
         source_base="$(basename -- "$source_file")"
-        source_line="$(awk -F '\t' -v n="$source_base" '$1==n && ($4+0)>0{print;exit}' "$source_tmp")"
+        source_line="$(awk -F '\t' -v n="$source_base" -v s="$new_size" '$1==n && $4==s && ($4+0)>0{print;exit}' "$source_tmp")"
     fi
 
     [ -n "$source_line" ] || {
