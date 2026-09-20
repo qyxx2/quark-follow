@@ -160,21 +160,21 @@ chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 700 "$0" 2>/dev/null || true
 
 log() {
-    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+    printf '[%s] [CHECK] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
 }
 
 info() {
-    printf '%s\n' "$*"
+    printf '[CHECK] INFO: %s\n' "$*"
     log "$*"
 }
 
 warn() {
-    printf 'WARN: %s\n' "$*" >&2
+    printf '[CHECK] WARN: %s\n' "$*" >&2
     log "WARN: $*"
 }
 
 error() {
-    printf 'ERROR: %s\n' "$*" >&2
+    printf '[CHECK] ERROR: %s\n' "$*" >&2
     log "ERROR: $*"
 }
 

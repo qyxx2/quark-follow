@@ -1,10 +1,28 @@
 import re
 import time
+import builtins
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
 MOVIE_URL = "https://www.seedhub.cc/movies/130168/"
 BASE_URL = "https://www.seedhub.cc"
+LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "test20.log"
+
+
+def log_print(*args, **kwargs):
+    builtins.print(*args, **kwargs)
+    message = kwargs.get("sep", " ").join(str(arg) for arg in args)
+    if message:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [PARSE] {message}{kwargs.get('end', chr(10))}"
+            )
+
+
+print = log_print
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)

@@ -5,7 +5,9 @@ set -u
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 CONFIG="$BASE_DIR/config"
 DB="$BASE_DIR/resource.db"
-LOG_FILE="$BASE_DIR/source_check.log"
+LOG_DIR_DEFAULT="$BASE_DIR/logs"
+LOG_DIR="$LOG_DIR_DEFAULT"
+LOG_FILE="$LOG_DIR/source_check.log"
 TMP_ROOT="/tmp/quark-follow-source-$$"
 
 mkdir -p "$TMP_ROOT"
@@ -28,6 +30,9 @@ fi
 # shellcheck disable=SC1090
 . "$CONFIG"
 
+LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
+LOG_FILE="$LOG_DIR/source_check.log"
+
 : "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
 
 QUARK_API_DELAY="${QUARK_API_DELAY:-2}"
@@ -43,7 +48,7 @@ SHARE_DEAD_FAIL_COUNT="${SHARE_DEAD_FAIL_COUNT:-3}"
 #   ./source_check.sh --share-id 1
 #   ./source_check.sh --show-id 1
 
-mkdir -p "$BASE_DIR" 2>/dev/null || true
+mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
 chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 600 "$LOG_FILE" 2>/dev/null || true
@@ -54,7 +59,7 @@ chmod 700 "$0" 2>/dev/null || true
 # ============================================================
 
 log() {
-    printf '[%s] %s\n' \
+    printf '[%s] [PARSE] %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
         "$*" >> "$LOG_FILE"
 }
@@ -859,7 +864,7 @@ done < "$SHARE_LIST"
 
 log "全部 source_check 结束：total=$TOTAL success=$SUCCESS fail=$FAIL"
 
-echo "source_check 完成：total=$TOTAL success=$SUCCESS fail=$FAIL"
+printf '[PARSE] source_check 完成：total=%s success=%s fail=%s\n' "$TOTAL" "$SUCCESS" "$FAIL"
 
 # 只要存在失败，返回非 0，方便 cron / 外部监控发现问题。
 if [ "$FAIL" -gt 0 ]; then

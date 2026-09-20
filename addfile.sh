@@ -6,7 +6,9 @@ BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 CONFIG="$BASE_DIR/config"
 TASKS="$BASE_DIR/tasks"
-LOG_FILE="$BASE_DIR/addfile.log"
+LOG_DIR_DEFAULT="$BASE_DIR/logs"
+LOG_DIR="$LOG_DIR_DEFAULT"
+LOG_FILE="$LOG_DIR/addfile.log"
 
 TMP_ROOT="/tmp/quark-follow-$$"
 
@@ -29,6 +31,9 @@ fi
 
 # shellcheck disable=SC1090
 . "$CONFIG"
+
+LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
+LOG_FILE="$LOG_DIR/addfile.log"
 
 : "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
 : "${OPENLIST_URL:?config 中没有 OPENLIST_URL}"
@@ -54,6 +59,7 @@ OPENLIST_REFRESH_INTERVAL="${OPENLIST_REFRESH_INTERVAL:-3}"
 CURL_TLS_MAX="${CURL_TLS_MAX:-1.2}"
 DRY_RUN="${DRY_RUN:-false}"
 
+mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
 
 chmod 600 "$CONFIG" 2>/dev/null || true
@@ -66,7 +72,7 @@ chmod 700 "$0" 2>/dev/null || true
 # ============================================================
 
 log() {
-    printf '[%s] %s\n' \
+    printf '[%s] [ADD] %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
         "$*" >> "$LOG_FILE"
 }

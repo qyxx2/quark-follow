@@ -96,7 +96,7 @@ WEBDAV_PASS='WebDAV 密码'
 | `RESOURCE_AUTO_DISCOVER` | `true` | 是否继续发现新的 SeedHub 分享。 |
 | `REPLACE_ENABLED` | `true` | 是否允许生成并执行替换任务。 |
 | `REPLACE_WINDOW_START_HOUR` / `REPLACE_WINDOW_END_HOUR` | `2` / `7` | 替换任务的本地小时窗口，左闭右开。 |
-| `LOG_DIR` | 脚本目录下的 `logs` | `resource_check.sh` 和 `replace.sh` 日志目录。 |
+| `LOG_DIR` | 脚本目录下的 `logs` | 所有生产脚本的日志目录。 |
 
 ### 配置 `resources.json`
 
@@ -125,7 +125,7 @@ WEBDAV_PASS='WebDAV 密码'
 1. 在 `config` 中设置 `DRY_RUN=true`；
 2. 启动容器：`./seedhub_start.sh`；
 3. 运行主流程：`./resource_check.sh`；
-4. 检查终端输出、`logs/resource_check.log`、`source_check.log`、`addfile.log` 和数据库中的缓存；
+4. 检查终端输出、`logs/resource_check.log`、`logs/seedhub_cache.log`、`logs/source_check.log`、`logs/addfile.log` 和数据库中的缓存；
 5. 确认目录与候选资源正确后，再将 `DRY_RUN=false` 并重新运行。
 
 ### 日常执行
@@ -167,7 +167,8 @@ sqlite3 resource.db 'SELECT id, show_id, episode, status, error FROM replace_que
 
 - `resource.db` 保存剧集、分享、分享内文件、WebDAV 文件和替换队列，是运行状态的核心。升级、重建或调试前先备份它。
 - `tasks` 是 `resource_check.sh` 与 `addfile.sh` 间的临时接口，会在后续运行中重新生成，不应手工当作长期任务队列维护。
-- 日志位于 `logs/resource_check.log`、`logs/replace.log`，以及仓库根目录的 `source_check.log`、`addfile.log`。建议由 logrotate 或外部脚本处理轮转和保留期。
+- 所有脚本日志均写入 `logs/`。生产流程使用 `seedhub_start.log`、`seedhub_cache.log`、`source_check.log`、`addfile.log`、`resource_check.log` 和 `replace.log`；`dock/` 中的初始化和调试脚本也会写入同一目录。
+- 每条日志均带有可供 Web 端筛选的阶段标记：`[PARSE]`（SeedHub/分享解析）、`[ADD]`（补集转存）、`[REPLACE]`（替换队列）、`[CHECK]`（主流程检查）或 `[INIT]`（数据库初始化）。建议由 logrotate 或外部脚本处理轮转和保留期。
 - 分享连续扫描失败达到 `SHARE_DEAD_FAIL_COUNT`（默认 `3`）后会标为 `dead`；修复 Cookie、网络或分享后，可在数据库中审慎地恢复其状态，再进行指定范围扫描。
 
 推荐的备份方式：

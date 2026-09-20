@@ -1,7 +1,24 @@
 import sqlite3
+import builtins
+from datetime import datetime
 from pathlib import Path
 
 DB_FILE = Path("/root/scripts/quark-follow/resource.db")
+LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "init_db.log"
+
+
+def log_print(*args, **kwargs):
+    builtins.print(*args, **kwargs)
+    message = kwargs.get("sep", " ").join(str(arg) for arg in args)
+    if message:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [INIT] {message}{kwargs.get('end', chr(10))}"
+            )
+
+
+print = log_print
 
 
 def main():
