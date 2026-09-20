@@ -619,7 +619,7 @@ UPDATE shares
        last_check=CURRENT_TIMESTAMP,
        last_success=CURRENT_TIMESTAMP,
        updated_at=CURRENT_TIMESTAMP
- WHERE id=$(sql_quote "$share_id");
+ WHERE id=$(sql_quote "$share_id") AND COALESCE(status,'unknown')!='excluded';
 COMMIT;
 SQL
 }
@@ -636,7 +636,7 @@ UPDATE shares
    SET fail_count=COALESCE(fail_count,0)+1,
        last_check=CURRENT_TIMESTAMP,
        updated_at=CURRENT_TIMESTAMP
- WHERE id=$(sql_quote "$share_id");
+ WHERE id=$(sql_quote "$share_id") AND COALESCE(status,'unknown')!='excluded';
 
 UPDATE shares
    SET status='dead'
@@ -712,6 +712,12 @@ process_share() {
     local scan_file
     local before_count after_count episode_count
 
+    status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    if [ "$status" = "excluded" ]; then
+        log "SOURCE跳过已排除 Share：share_id=$share_id show_id=$show_id rank=$seedhub_rank url=$url"
+        return 0
+    fi
+
     log "SOURCE开始：share_id=$share_id show_id=$show_id rank=$seedhub_rank status=$status url=$url"
 
     pwd_id="$(get_pwd_id "$url")"
@@ -746,6 +752,12 @@ process_share() {
     mv "$dedup_file" "$scan_file"
 
     before_count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM share_files WHERE share_id=$(sql_quote "$share_id");")"
+
+    current_status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    if [ "$current_status" = "excluded" ]; then
+        log "SOURCE跳过缓存写入：Share 在扫描过程中被排除：share_id=$share_id url=$url"
+        return 0
+    fi
 
     if ! replace_share_cache "$share_id" "$scan_file"; then
         mark_share_failure "$share_id" || true
@@ -819,26 +831,26 @@ case "$MODE" in
         sqlite3 -tabs "$DB" <<'SQL' > "$SHARE_LIST"
 SELECT id, show_id, url, seedhub_rank, status
   FROM shares
- WHERE COALESCE(status,'unknown') != 'dead'
+ WHERE COALESCE(status,'unknown') NOT IN ('dead','excluded')
  ORDER BY show_id, seedhub_rank, id;
 SQL
         ;;
 
     share)
         sqlite3 -tabs "$DB" \
-            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE id=$(sql_quote "$TARGET_ID") LIMIT 1;" \
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE id=$(sql_quote "$TARGET_ID") AND COALESCE(status,'unknown')!='excluded' LIMIT 1;" \
             > "$SHARE_LIST"
         ;;
 
     show)
         sqlite3 -tabs "$DB" \
-            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE show_id=$(sql_quote "$TARGET_ID") AND COALESCE(status,'unknown') != 'dead' ORDER BY seedhub_rank, id;" \
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE show_id=$(sql_quote "$TARGET_ID") AND COALESCE(status,'unknown') NOT IN ('dead','excluded') ORDER BY seedhub_rank, id;" \
             > "$SHARE_LIST"
         ;;
 esac
 
 if [ ! -s "$SHARE_LIST" ]; then
-    log "没有需要扫描的 shares：mode=$MODE target=${TARGET_ID:-all}"
+    log "没有需要扫描的 shares（排除项也不会扫描）：mode=$MODE target=${TARGET_ID:-all}"
     echo "没有需要扫描的 shares。"
     exit 0
 fi
@@ -862,7 +874,7 @@ while IFS=$'\t' read -r share_id show_id url seedhub_rank status; do
     fi
 done < "$SHARE_LIST"
 
-log "全部 source_check 结束：total=$TOTAL success=$SUCCESS fail=$FAIL"
+log "全部 source_check 结束：total=$TOTAL success=$SUCCESS fail=$FAIL（excluded 已跳过）"
 
 printf '[PARSE] source_check 完成：total=%s success=%s fail=%s\n' "$TOTAL" "$SUCCESS" "$FAIL"
 

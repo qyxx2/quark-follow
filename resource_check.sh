@@ -618,7 +618,7 @@ SET source_share_id = (
       AND sf.episode=webdav_files.episode
       AND sf.filename=webdav_files.filename
       AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)
-      AND COALESCE(ss.status,'unknown')!='dead'
+      AND COALESCE(ss.status,'unknown') NOT IN ('dead','excluded')
     ORDER BY COALESCE(ss.seedhub_rank,999999), ss.id
     LIMIT 1
 )
@@ -654,7 +654,7 @@ get_max_known_episode() {
     local webdav_file="${2:-}"
     local share_max=0 webdav_max=0 max=0
 
-    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' AND sf.episode GLOB 'S01E[0-9][0-9]';")"
+    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB 'S01E[0-9][0-9]';")"
 
     if [ -n "$webdav_file" ] && [ -s "$webdav_file" ]; then
         webdav_max="$(awk -F '\t' '
@@ -693,7 +693,7 @@ build_candidates() {
     [ -n "$in_sql" ] || return 0
 
     sqlite3 -tabs "$DB" \
-        "SELECT s.id,s.url,COALESCE(s.seedhub_rank,999999),COALESCE(s.fail_count,0),sf.episode,COALESCE(sf.size,0),sf.filename FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' AND sf.episode IN ($in_sql) ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT s.id,s.url,COALESCE(s.seedhub_rank,999999),COALESCE(s.fail_count,0),sf.episode,COALESCE(sf.size,0),sf.filename FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode IN ($in_sql) ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$output"
 }
 
@@ -733,7 +733,7 @@ WITH candidate_shares AS (
     FROM share_files sf
     JOIN shares s ON s.id=sf.share_id
     WHERE s.show_id=$(sql_quote "$show_id")
-      AND COALESCE(s.status,'unknown')!='dead'
+      AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded')
       AND sf.episode IN ($in_sql)
 )
 SELECT id,url,seedhub_rank
@@ -747,7 +747,7 @@ FROM (
     JOIN shares s ON s.id=cs.id
     JOIN share_files sf_all ON sf_all.share_id=s.id
     WHERE s.show_id=$(sql_quote "$show_id")
-      AND COALESCE(s.status,'unknown')!='dead'
+      AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded')
     GROUP BY s.id,s.url,s.seedhub_rank
 ) ranked
 ORDER BY episode_count DESC,seedhub_rank ASC,id ASC
@@ -840,7 +840,7 @@ scan_unchecked_shares() {
     # 扫描所有尚未成功检查的 Share，否则 share_files 只有极少数来源，tasks 无法
     # 按完整集数进行排序。
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$output"
 
     while IFS= read -r sid; do
@@ -860,7 +860,7 @@ recheck_existing_shares() {
     threshold_epoch=$((now_epoch - RESOURCE_RECHECK_HOURS * 3600))
 
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s LEFT JOIN (SELECT share_id,MAX(strftime('%s',last_check)) AS checked_epoch,COUNT(*) AS file_count FROM share_files GROUP BY share_id) x ON x.share_id=s.id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' AND (COALESCE(x.file_count,0)=0 OR COALESCE(x.checked_epoch,0)<$threshold_epoch) ORDER BY CASE WHEN COALESCE(x.file_count,0)=0 THEN 0 ELSE 1 END,COALESCE(s.seedhub_rank,999999),s.id LIMIT $RESOURCE_RECHECK_EXISTING_MAX;" \
+        "SELECT s.id FROM shares s LEFT JOIN (SELECT share_id,MAX(strftime('%s',last_check)) AS checked_epoch,COUNT(*) AS file_count FROM share_files GROUP BY share_id) x ON x.share_id=s.id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (COALESCE(x.file_count,0)=0 OR COALESCE(x.checked_epoch,0)<$threshold_epoch) ORDER BY CASE WHEN COALESCE(x.file_count,0)=0 THEN 0 ELSE 1 END,COALESCE(s.seedhub_rank,999999),s.id LIMIT $RESOURCE_RECHECK_EXISTING_MAX;" \
         > "$output"
 }
 
@@ -889,7 +889,7 @@ scan_new_seedhub_shares() {
 
         list="$TMP_ROOT/new-shares-${show_id}-${round}.txt"
         sqlite3 "$DB" \
-            "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.seedhub_rank,0)>$old_rank AND COALESCE(s.status,'unknown')!='dead' AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY s.seedhub_rank,s.id;" \
+            "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.seedhub_rank,0)>$old_rank AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY s.seedhub_rank,s.id;" \
             > "$list"
 
         if [ ! -s "$list" ]; then
@@ -924,7 +924,7 @@ replacement_window_open() {
 refresh_replacement_sources() {
     local show_id="$1" show_name="$2" output="$3"
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' ORDER BY CASE WHEN s.last_success IS NULL THEN 0 ELSE 1 END,COALESCE(strftime('%s',s.last_check),0),COALESCE(s.seedhub_rank,999999),s.id LIMIT $REPLACE_SOURCE_CHECK_MAX;" \
+        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') ORDER BY CASE WHEN s.last_success IS NULL THEN 0 ELSE 1 END,COALESCE(strftime('%s',s.last_check),0),COALESCE(s.seedhub_rank,999999),s.id LIMIT $REPLACE_SOURCE_CHECK_MAX;" \
         > "$output"
 
     while IFS= read -r sid; do
@@ -939,7 +939,7 @@ queue_replacements() {
     local episode sid source_file rank new_size old_file old_size gain need_ratio threshold existing pending_new
 
     sqlite3 -tabs "$DB" \
-        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown')!='dead' ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$all_file"
 
     awk -F '\t' '!seen[$1]++ {print}' "$all_file" > "$best_file"

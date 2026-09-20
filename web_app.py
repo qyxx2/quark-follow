@@ -33,7 +33,7 @@ app.config.update(
 )
 launch_lock = threading.Lock()
 SENSITIVE = {"QUARK_COOKIE", "OPENLIST_TOKEN", "OPENLIST_PASSWORD", "WEBDAV_PASS"}
-LOG_CATEGORIES = {"ALL", "PARSE", "SCAN", "ADD", "REPLACE", "DELETE", "CHECK", "INIT", "WARN", "ERROR"}
+LOG_CATEGORIES = {"ALL", "PARSE", "SCAN", "ADD", "REPLACE", "DELETE", "EXCLUDE", "CHECK", "INIT", "WARN", "ERROR"}
 CONFIG_FIELDS = [
     ("Quark", [
         ("QUARK_COOKIE", "Cookie", "password"),
@@ -146,6 +146,8 @@ def background_work_running():
         return "resource_check"
     if process_for("source_check.sh") is not None:
         return "source_check"
+    if process_for("addfile.sh") is not None:
+        return "addfile"
     if state["replace"]["running"]:
         return "replace"
     return None
@@ -386,7 +388,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:13px max(16px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}nav{display:flex;gap:12px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}@media(max-width:560px){header{align-items:flex-start;flex-direction:column}th,td{padding:7px 5px}.container{padding:10px}}</style><body><header><strong>quark-follow</strong><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:13px max(16px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}nav{display:flex;gap:12px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}@media(max-width:560px){header{align-items:flex-start;flex-direction:column}th,td{padding:7px 5px}.container{padding:10px}}</style><body><header><strong>quark-follow</strong><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -427,7 +429,7 @@ def resources():
     for r in rows:
         r['missing'] = max(0, (r['total_episodes'] or 0) - (r['owned'] or 0))
     return render_template_string(
-        BASE_TEMPLATE + """<h1>资源</h1><div class=actions><a class=button href='/resources/add'>添加资源</a></div><div class=tablewrap><table><tr><th>名称</th><th>总/拥有/缺失</th><th>Share</th><th>状态</th><th>WebDAV 路径</th></tr>{% for r in rows %}<tr><td><a href='/resources/{{r.id}}'>{{r.name}}</a></td><td>{{r.total_episodes or 0}} / {{r.owned or 0}} / {{r.missing}}</td><td>{{r.share_count}}</td><td>{{'已完成' if r.missing == 0 else '待补集'}}</td><td>{{r.webdav_path}}</td></tr>{% else %}<tr><td colspan=5>数据库暂无资源。</td></tr>{% endfor %}</table></div></main>""",
+        BASE_TEMPLATE + """<h1>资源</h1><div class=actions><a class=button href='/resources/add'>添加资源</a><a class='button secondary' href='/resources/excluded'>排除列表</a></div><div class=tablewrap><table><tr><th>名称</th><th>总/拥有/缺失</th><th>Share</th><th>状态</th><th>WebDAV 路径</th></tr>{% for r in rows %}<tr><td><a href='/resources/{{r.id}}'>{{r.name}}</a></td><td>{{r.total_episodes or 0}} / {{r.owned or 0}} / {{r.missing}}</td><td>{{r.share_count}}</td><td>{{'已完成' if r.missing == 0 else '待补集'}}</td><td>{{r.webdav_path}}</td></tr>{% else %}<tr><td colspan=5>数据库暂无资源。</td></tr>{% endfor %}</table></div></main>""",
         rows=rows,
     )
 
@@ -448,13 +450,184 @@ def resource_detail(show_id):
     total = show['total_episodes'] or 0
     missing = [x for x in range(1, total + 1) if x not in owned]
     return render_template_string(
-        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\\n\\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\\nWebDAV 中已经存在的文件不会删除。\\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td><a href='{{s.url}}' rel=noopener>打开</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td><form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form></td></tr>{% endfor %}</table></div></main>""",
+        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\\n\\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\\nWebDAV 中已经存在的文件不会删除。\\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
         show=show,
         shares=shares,
         total=total,
         owned=owned,
         missing=missing,
     )
+
+
+def exclude_share_db(show_id, share_id):
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE id=? AND show_id=?",
+            (share_id, show_id),
+        ).fetchone()
+        if not row:
+            con.rollback()
+            return None, 0, 0
+        if row["status"] == "excluded":
+            con.commit()
+            return dict(row), 0, 0
+
+        cache_count = con.execute(
+            "SELECT COUNT(*) FROM share_files WHERE share_id=?", (share_id,)
+        ).fetchone()[0]
+        queue_count = con.execute(
+            "SELECT COUNT(*) FROM replace_queue WHERE source_share_id=? AND status='pending'",
+            (share_id,),
+        ).fetchone()[0]
+
+        con.execute("DELETE FROM share_files WHERE share_id=?", (share_id,))
+        con.execute(
+            "DELETE FROM replace_queue WHERE source_share_id=? AND status='pending'",
+            (share_id,),
+        )
+        con.execute(
+            "UPDATE shares SET status='excluded', fail_count=0, last_check=NULL, "
+            "last_success=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND show_id=?",
+            (share_id, show_id),
+        )
+        con.commit()
+        return dict(row), cache_count, queue_count
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def clear_share_exclusion(share_id):
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE id=?",
+            (share_id,),
+        ).fetchone()
+        if not row:
+            con.rollback()
+            return None
+        if row["status"] != "excluded":
+            con.commit()
+            return dict(row)
+
+        con.execute(
+            "UPDATE shares SET status='unknown', fail_count=0, last_check=NULL, "
+            "last_success=NULL, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='excluded'",
+            (share_id,),
+        )
+        con.commit()
+        return dict(row)
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+@app.post('/resources/<int:show_id>/shares/<int:share_id>/exclude')
+@login_required
+def exclude_share(show_id, share_id):
+    busy = background_work_running()
+    if busy:
+        flash(f'当前有 {busy} 任务正在运行，暂不能排除 Share。请等待任务结束后再操作。')
+        write_web_log(
+            "EXCLUDE",
+            f"排除请求被拒绝：show_id={show_id} share_id={share_id} reason={busy}_running",
+        )
+        return redirect(request.referrer or url_for("resource_detail", show_id=show_id))
+
+    try:
+        row, cache_count, queue_count = exclude_share_db(show_id, share_id)
+    except sqlite3.Error as exc:
+        write_web_log(
+            "EXCLUDE",
+            f"Share 排除失败：show_id={show_id} share_id={share_id} error={exc}",
+        )
+        flash(f'排除 Share 失败：{exc}')
+        return redirect(url_for("resource_detail", show_id=show_id))
+
+    if not row:
+        abort(404)
+    if row["status"] == "excluded":
+        flash(f'Share #{share_id} 已经在排除列表中。')
+        return redirect(url_for("resource_detail", show_id=show_id))
+
+    write_web_log(
+        "EXCLUDE",
+        "Share 已排除："
+        f"show_id={show_id} share_id={share_id} rank={row['seedhub_rank']} "
+        f"url={row['url']} share_files_deleted={cache_count} "
+        f"pending_replace_deleted={queue_count}",
+    )
+    flash(f'Share #{share_id} 已排除；同时清除了 {cache_count} 条 share_files 缓存。')
+    return redirect(url_for("resource_detail", show_id=show_id))
+
+
+@app.route('/resources/excluded')
+@login_required
+def excluded_resources():
+    rows = db_query(
+        "SELECT s.id, s.show_id, s.seedhub_rank, s.url, s.updated_at, "
+        "sh.name AS show_name FROM shares s JOIN shows sh ON sh.id=s.show_id "
+        "WHERE s.status='excluded' "
+        "ORDER BY sh.name, COALESCE(s.seedhub_rank,999999), s.id"
+    )
+    return render_template_string(
+        BASE_TEMPLATE + "<h1>排除列表</h1>"
+        "<p class=muted>这里保存被手动排除的 Share。它们不会进入扫描、候选、排名或替换来源。"
+        "清除后会恢复为待重新扫描状态。</p>"
+        "<div class=tablewrap><table>"
+        "<tr><th>share id</th><th>资源</th><th>rank</th><th>Share URL</th><th>操作</th></tr>"
+        "{% for r in rows %}"
+        "<tr><td>{{r.id}}</td><td><a href='/resources/{{r.show_id}}'>{{r.show_name}}</a></td>"
+        "<td>{{r.seedhub_rank}}</td><td><a class=url href='{{r.url}}' rel=noopener>{{r.url}}</a></td>"
+        "<td><form method=post action='/resources/excluded/{{r.id}}/clear'><button>清除</button></form></td></tr>"
+        "{% else %}<tr><td colspan=5>当前没有排除的 Share。</td></tr>{% endfor %}"
+        "</table></div><p><a class=button href='/resources'>返回资源</a></p></main>",
+        rows=rows,
+    )
+
+
+@app.post('/resources/excluded/<int:share_id>/clear')
+@login_required
+def clear_excluded_share(share_id):
+    try:
+        row = clear_share_exclusion(share_id)
+    except sqlite3.Error as exc:
+        write_web_log(
+            "EXCLUDE",
+            f"清除排除失败：share_id={share_id} error={exc}",
+        )
+        flash(f'清除排除失败：{exc}')
+        return redirect(url_for("excluded_resources"))
+
+    if not row:
+        abort(404)
+    if row["status"] != "excluded":
+        flash(f'Share #{share_id} 当前不是排除状态，无需清除。')
+        return redirect(url_for("excluded_resources"))
+
+    write_web_log(
+        "EXCLUDE",
+        f"Share 排除已清除：share_id={share_id} show_id={row['show_id']} "
+        f"rank={row['seedhub_rank']} url={row['url']}",
+    )
+    flash(f'Share #{share_id} 已从排除列表清除；下次资源检查会重新扫描它。')
+    return redirect(url_for("excluded_resources"))
+
 
 @app.post('/resources/<int:show_id>/delete')
 @login_required
@@ -590,7 +763,7 @@ def logs():
     category = category.lower()
     return render_template_string(
         BASE_TEMPLATE + """<h1>日志</h1><div class=actions>{% for c in cats %}<a class='button' href='/logs?category={{c}}'>{{c}}</a>{% endfor %}</div><div id=events class=card style='margin-top:14px'></div><script>const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));async function load(){let e=await fetch('/api/logs?category={{category}}').then(r=>r.json());document.querySelector('#events').innerHTML=e.map(x=>`<div class=event><span class=tag>${x.category}</span> <span class=muted>${esc(x.time)} · ${esc(x.source)}</span><pre class=log>${esc(x.message)}</pre></div>`).join('')||'暂无匹配日志'}load();setInterval(load,3000)</script></main>""",
-        cats=['all','PARSE','SCAN','ADD','REPLACE','DELETE','CHECK','INIT','WARN','ERROR'],
+        cats=['all','PARSE','SCAN','ADD','REPLACE','DELETE','EXCLUDE','CHECK','INIT','WARN','ERROR'],
         category=category,
     )
 
