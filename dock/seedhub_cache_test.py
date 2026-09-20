@@ -1,6 +1,9 @@
 import re
 import sqlite3
 import time
+import builtins
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
@@ -12,6 +15,21 @@ SHOW_NAME = "重器"
 WEBdav_PATH = "/kuake/其他/重器"
 
 CACHE_LIMIT = 20
+LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "seedhub_cache_test.log"
+
+
+def log_print(*args, **kwargs):
+    builtins.print(*args, **kwargs)
+    message = kwargs.get("sep", " ").join(str(arg) for arg in args)
+    if message:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [PARSE] {message}{kwargs.get('end', chr(10))}"
+            )
+
+
+print = log_print
 
 
 def main():

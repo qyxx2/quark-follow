@@ -45,6 +45,9 @@ if [ ! -f "$CONFIG" ]; then
 fi
 . "$CONFIG"
 
+LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
+LOG_FILE="$LOG_DIR/replace.log"
+
 : "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
 : "${OPENLIST_URL:?config 中没有 OPENLIST_URL}"
 : "${OPENLIST_TOKEN:?config 中没有 OPENLIST_TOKEN}"
@@ -98,18 +101,18 @@ for table in shows shares share_files webdav_files replace_queue; do
 done
 
 log() {
-    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+    printf '[%s] [REPLACE] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
 }
 info() {
-    printf '%s\n' "$*"
+    printf '[REPLACE] INFO: %s\n' "$*"
     log "$*"
 }
 warn() {
-    printf 'WARN: %s\n' "$*" >&2
+    printf '[REPLACE] WARN: %s\n' "$*" >&2
     log "WARN: $*"
 }
 error() {
-    printf 'ERROR: %s\n' "$*" >&2
+    printf '[REPLACE] ERROR: %s\n' "$*" >&2
     log "ERROR: $*"
 }
 

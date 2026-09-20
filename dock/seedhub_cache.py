@@ -4,6 +4,9 @@ import re
 import sys
 import time
 import sqlite3
+from datetime import datetime
+from pathlib import Path
+import builtins
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
@@ -14,6 +17,24 @@ from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://www.seedhub.cc"
 DB_FILE = "/data/resource.db"
+LOG_FILE = Path("/data/logs/seedhub_cache.log")
+
+
+def log_print(*args, **kwargs):
+    """Mirror parser output to the shared log directory with a queryable tag."""
+    builtins.print(*args, **kwargs)
+    separator = kwargs.get("sep", " ")
+    end = kwargs.get("end", "\n")
+    message = separator.join(str(arg) for arg in args)
+    if message:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [PARSE] {message}{end}"
+            )
+
+
+print = log_print
 
 # 每次最多新增扫描多少个 SeedHub 分享
 SCAN_BATCH_SIZE = 20
