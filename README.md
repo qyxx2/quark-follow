@@ -200,3 +200,23 @@ sqlite3 resource.db ".backup 'backups/resource-$(date +%F-%H%M%S).db'"
 ## 免责声明
 
 本项目仅供个人学习和自动化运维使用。请确保你对所访问、转存和存储的内容拥有合法权限，并遵守相关服务条款与当地法律。
+
+## Web 管理页面
+
+Web 管理页面是现有 Bash 工作流之上的受认证管理层：它直接读取 `resource.db`、`logs/` 和现有锁目录，并且只会受控地在后台启动已有脚本，不会替代解析、扫描或转存逻辑。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-web.txt
+export QUARK_WEB_USERNAME='admin'
+export QUARK_WEB_PASSWORD='use-a-long-unique-password'
+# 可选：在 HTTPS 反向代理后设置稳定的 session 密钥及安全 Cookie。
+export QUARK_WEB_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+export QUARK_WEB_HTTPS=1
+python3 web_app.py
+```
+
+服务固定监听 `0.0.0.0:5233`，局域网设备可访问 `http://<NAS-IP>:5233`。启动前必须设置 `QUARK_WEB_USERNAME` 和 `QUARK_WEB_PASSWORD`，否则服务会拒绝启动。建议仅在受信任局域网使用，或通过 HTTPS 反向代理公开。
+
+页面提供 Dashboard、资源及 Share 详情、`resources.json` 添加入口、分类日志、`config.local` 的受限表单编辑和受控任务启动。敏感配置值不会回传给浏览器；表单中的敏感字段留空会保留已有值。每次保存 `config.local` 前都会写入 `config.local.bak`。Web 不提供任意 Shell 命令、任意文件读取或路径浏览接口。

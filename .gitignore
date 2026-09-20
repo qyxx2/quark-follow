@@ -1,2 +1,5 @@
 # Local runtime configuration; may contain credentials.
 config.local
+
+# Local configuration backups may contain credentials.
+config.local.bak
