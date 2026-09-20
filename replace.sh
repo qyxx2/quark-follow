@@ -16,13 +16,13 @@
 #
 # 接口：
 #   无命令行参数。
-#   同目录 config / resource.db。
+#   同目录 config.local / resource.db。
 # ============================================================
 
 set -u
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-CONFIG="$BASE_DIR/config"
+CONFIG="$BASE_DIR/config.local"
 DB="$BASE_DIR/resource.db"
 TMP_ROOT="/tmp/quark-follow-replace-$$"
 LOCK_DIR="$BASE_DIR/replace.lock"
@@ -40,7 +40,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 if [ ! -f "$CONFIG" ]; then
-    echo "ERROR: 找不到 config：$CONFIG" >&2
+    echo "ERROR: 找不到 config.local：$CONFIG" >&2
     exit 2
 fi
 . "$CONFIG"
@@ -48,12 +48,12 @@ fi
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/replace.log"
 
-: "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
-: "${OPENLIST_URL:?config 中没有 OPENLIST_URL}"
-: "${OPENLIST_TOKEN:?config 中没有 OPENLIST_TOKEN}"
-: "${WEBDAV_URL:?config 中没有 WEBDAV_URL}"
-: "${WEBDAV_USER:?config 中没有 WEBDAV_USER}"
-: "${WEBDAV_PASS:?config 中没有 WEBDAV_PASS}"
+: "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
+: "${OPENLIST_URL:?config.local 中没有 OPENLIST_URL}"
+: "${OPENLIST_TOKEN:?config.local 中没有 OPENLIST_TOKEN}"
+: "${WEBDAV_URL:?config.local 中没有 WEBDAV_URL}"
+: "${WEBDAV_USER:?config.local 中没有 WEBDAV_USER}"
+: "${WEBDAV_PASS:?config.local 中没有 WEBDAV_PASS}"
 
 CURL_TLS_MAX="${CURL_TLS_MAX:-1.2}"
 QUARK_API_DELAY="${QUARK_API_DELAY:-2}"
@@ -68,6 +68,7 @@ OPENLIST_PASSWORD="${OPENLIST_PASSWORD:-}"
 
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
+chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 600 "$LOG_FILE" 2>/dev/null || true
 chmod 700 "$0" 2>/dev/null || true
 

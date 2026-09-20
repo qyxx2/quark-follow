@@ -60,9 +60,10 @@ resource_check.sh ──► SeedHub/Playwright ──► SQLite（剧集与分�
 git clone <repository-url> quark-follow
 cd quark-follow
 
-# 编辑真实配置；config 会被 shell source，只能填写受信任的 shell 变量赋值。
-chmod 600 config
-${EDITOR:-vi} config
+# 创建并编辑本机真实配置；config.local 会被 shell source，只能填写受信任的 shell 变量赋值。
+cp config.example config.local
+chmod 600 config.local
+${EDITOR:-vi} config.local
 
 # 编辑待追踪资源。
 ${EDITOR:-vi} resources.json
@@ -71,9 +72,9 @@ ${EDITOR:-vi} resources.json
 ./seedhub_start.sh
 ```
 
-### 配置 `config`
+### 配置 `config.local`
 
-`config` 是 shell 配置文件，变量值通常用单引号包裹。至少应替换下列占位值：
+`config.example` 是提交到仓库的脱敏模板；首次安装时复制为不受 Git 跟踪的 `config.local`。运行脚本和后续 Web 配置修改均读取 `config.local`。`config.local` 是 shell 配置文件，变量值通常用单引号包裹。至少应替换下列占位值：
 
 ```bash
 QUARK_COOKIE='完整 Cookie'
@@ -122,7 +123,7 @@ WEBDAV_PASS='WebDAV 密码'
 
 ### 首次安全演练
 
-1. 在 `config` 中设置 `DRY_RUN=true`；
+1. 在 `config.local` 中设置 `DRY_RUN=true`；
 2. 启动容器：`./seedhub_start.sh`；
 3. 运行主流程：`./resource_check.sh`；
 4. 检查终端输出、`logs/resource_check.log`、`logs/seedhub_cache.log`、`logs/source_check.log`、`logs/addfile.log` 和数据库中的缓存；
@@ -182,7 +183,6 @@ sqlite3 resource.db ".backup 'backups/resource-$(date +%F-%H%M%S).db'"
 
 以下是基于当前代码结构的优先改进方向：
 
-1. **凭据与示例分离（高优先级）**：`config` 当前被版本控制且会被脚本直接 source；应将其替换为不跟踪的 `config.local`，提交脱敏的 `config.example`，并补充 `.gitignore`，以降低 Cookie、Token 和 WebDAV 密码误提交的风险。
 2. **统一路径与部署方式（高优先级）**：`dock/init_db.py` 的数据库路径是硬编码的 `/root/scripts/quark-follow/resource.db`，而运行脚本根据自身目录定位数据库。应改为从脚本位置或环境变量推导路径，并提供可重复执行的一键初始化命令。
 3. **补齐可重复测试（高优先级）**：现有 Python 文件中包含依赖真实站点、真实数据库和可视浏览器的试验脚本。应将页面解析、集数提取、文件名解析和 SQLite 迁移拆分为纯函数，并以 HTML fixture、临时 SQLite 和 HTTP mock 覆盖正常与失败场景；CI 至少运行 Bash 语法检查、Python 静态检查和单元测试。
 4. **收敛重复实现（中优先级）**：夸克请求、限速、`stoken` 缓存、剧集名解析等逻辑散落在多个 Bash 脚本中。抽取公共库后可减少修复不一致、并降低维护成本；全局限速锁也应改为跨入口共享的稳定锁文件。
@@ -192,8 +192,8 @@ sqlite3 resource.db ".backup 'backups/resource-$(date +%F-%H%M%S).db'"
 
 ## 安全说明
 
-- `config` 中保存高权限 Cookie、Token 和 WebDAV 密码；应设置为仅运行账户可读，避免上传、粘贴到 issue 或写入日志。
-- `config` 会被 `source` 执行，因此它不是普通 INI/JSON 文件；不要从不可信来源复制内容。
+- `config.local` 中保存高权限 Cookie、Token 和 WebDAV 密码；它已被 `.gitignore` 忽略，应保持仅运行账户可读，避免上传、粘贴到 issue 或写入日志。
+- `config.local` 会被 `source` 执行，因此它不是普通 INI/JSON 文件；不要从不可信来源复制内容。
 - 运行账户应只拥有目标 OpenList/WebDAV 路径的必要权限。先使用一个隔离的测试目录验证自动创建目录、重命名和替换行为。
 - 替换流程会在确认新文件存在后删除旧文件。即使脚本包含恢复尝试，也不能代替备份；启用 `REPLACE_ENABLED` 前请确认备份与夜间窗口设置。
 

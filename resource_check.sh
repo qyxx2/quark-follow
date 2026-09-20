@@ -14,7 +14,7 @@
 #     ]
 #   }
 #
-# directory 为空/省略：使用 config 的 WEBDAV_DEFAULT_ROOT
+# directory 为空/省略：使用 config.local 的 WEBDAV_DEFAULT_ROOT
 # 例如：
 #   directory="/kuake/电视剧"
 #   SeedHub 标题="test"
@@ -44,7 +44,7 @@
 set -u
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-CONFIG="$BASE_DIR/config"
+CONFIG="$BASE_DIR/config.local"
 RESOURCES_FILE="$BASE_DIR/resources.json"
 DB="$BASE_DIR/resource.db"
 TASKS="$BASE_DIR/tasks"
@@ -77,19 +77,19 @@ trap 'exit 130' INT TERM
 # ============================================================
 
 if [ ! -f "$CONFIG" ]; then
-    echo "ERROR: 找不到 config：$CONFIG" >&2
+    echo "ERROR: 找不到 config.local：$CONFIG" >&2
     exit 2
 fi
 
 # shellcheck disable=SC1090
 . "$CONFIG"
 
-: "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
-: "${OPENLIST_URL:?config 中没有 OPENLIST_URL}"
-: "${OPENLIST_TOKEN:?config 中没有 OPENLIST_TOKEN}"
-: "${WEBDAV_URL:?config 中没有 WEBDAV_URL}"
-: "${WEBDAV_USER:?config 中没有 WEBDAV_USER}"
-: "${WEBDAV_PASS:?config 中没有 WEBDAV_PASS}"
+: "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
+: "${OPENLIST_URL:?config.local 中没有 OPENLIST_URL}"
+: "${OPENLIST_TOKEN:?config.local 中没有 OPENLIST_TOKEN}"
+: "${WEBDAV_URL:?config.local 中没有 WEBDAV_URL}"
+: "${WEBDAV_USER:?config.local 中没有 WEBDAV_USER}"
+: "${WEBDAV_PASS:?config.local 中没有 WEBDAV_PASS}"
 
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/resource_check.log"
@@ -135,7 +135,7 @@ RESOURCE_ADD_VERIFY_INTERVAL="${RESOURCE_ADD_VERIFY_INTERVAL:-10}"
 # ============================================================
 
 if [ "$#" -ne 0 ]; then
-    echo "ERROR: resource_check.sh 不接受命令行参数；请只修改 resources.json 和 config。" >&2
+    echo "ERROR: resource_check.sh 不接受命令行参数；请只修改 resources.json 和 config.local。" >&2
     exit 2
 fi
 
