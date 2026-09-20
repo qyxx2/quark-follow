@@ -3,7 +3,7 @@
 set -u
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-CONFIG="$BASE_DIR/config"
+CONFIG="$BASE_DIR/config.local"
 DB="$BASE_DIR/resource.db"
 LOG_DIR_DEFAULT="$BASE_DIR/logs"
 LOG_DIR="$LOG_DIR_DEFAULT"
@@ -23,7 +23,7 @@ trap cleanup EXIT INT TERM
 # ============================================================
 
 if [ ! -f "$CONFIG" ]; then
-    echo "ERROR: 找不到 config: $CONFIG" >&2
+    echo "ERROR: 找不到 config.local: $CONFIG" >&2
     exit 1
 fi
 
@@ -33,7 +33,7 @@ fi
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/source_check.log"
 
-: "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
+: "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
 
 QUARK_API_DELAY="${QUARK_API_DELAY:-2}"
 CURL_TLS_MAX="${CURL_TLS_MAX:-1.2}"

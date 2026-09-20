@@ -4,7 +4,7 @@ set -u
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
-CONFIG="$BASE_DIR/config"
+CONFIG="$BASE_DIR/config.local"
 TASKS="$BASE_DIR/tasks"
 LOG_DIR_DEFAULT="$BASE_DIR/logs"
 LOG_DIR="$LOG_DIR_DEFAULT"
@@ -25,7 +25,7 @@ trap cleanup EXIT INT TERM
 # ============================================================
 
 if [ ! -f "$CONFIG" ]; then
-    echo "ERROR: 找不到 config"
+    echo "ERROR: 找不到 config.local"
     exit 1
 fi
 
@@ -35,12 +35,12 @@ fi
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/addfile.log"
 
-: "${QUARK_COOKIE:?config 中没有 QUARK_COOKIE}"
-: "${OPENLIST_URL:?config 中没有 OPENLIST_URL}"
-: "${OPENLIST_TOKEN:?config 中没有 OPENLIST_TOKEN}"
-: "${WEBDAV_URL:?config 中没有 WEBDAV_URL}"
-: "${WEBDAV_USER:?config 中没有 WEBDAV_USER}"
-: "${WEBDAV_PASS:?config 中没有 WEBDAV_PASS}"
+: "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
+: "${OPENLIST_URL:?config.local 中没有 OPENLIST_URL}"
+: "${OPENLIST_TOKEN:?config.local 中没有 OPENLIST_TOKEN}"
+: "${WEBDAV_URL:?config.local 中没有 WEBDAV_URL}"
+: "${WEBDAV_USER:?config.local 中没有 WEBDAV_USER}"
+: "${WEBDAV_PASS:?config.local 中没有 WEBDAV_PASS}"
 
 QUARK_API_DELAY="${QUARK_API_DELAY:-2}"
 QUARK_TASK_POLL="${QUARK_TASK_POLL:-8}"

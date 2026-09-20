@@ -2,11 +2,9 @@
 # Quark
 # ==============================
 
-# 完整 Cookie
-# 不要把 Cookie 写进 tasks
-QUARK_COOKIE='xxxxxx'
-# Quark API 请求之间的最小间隔
-# 多任务同时运行时也是全局限制
+# 完整 Cookie。不要把 Cookie 写进 tasks。
+QUARK_COOKIE='replace-with-your-quark-cookie'
+# Quark API 请求之间的最小间隔；多任务同时运行时也是全局限制。
 QUARK_API_DELAY=2
 
 # 转存任务查询间隔
@@ -21,10 +19,10 @@ QUARK_TASK_TIMEOUT=7200
 # ==============================
 
 # 不要带最后的 /
-OPENLIST_URL='http://192.168.1.1:1234'
+OPENLIST_URL='http://openlist-host:5244'
 
 # OpenList API Token
-OPENLIST_TOKEN='xxxxxxxx'
+OPENLIST_TOKEN='replace-with-your-openlist-token'
 
 # 如果 target 本身没有设置密码，就留空
 OPENLIST_PASSWORD=''
@@ -34,12 +32,10 @@ OPENLIST_PASSWORD=''
 # WebDAV
 # ==============================
 
-# OpenList WebDAV 地址
-# 例如：https://example.com/dav
-WEBDAV_URL='http://192.168.1.1:5255/dav'
-
-WEBDAV_USER='user'
-WEBDAV_PASS='xxxxxxxx'
+# OpenList WebDAV 地址，例如：https://example.com/dav
+WEBDAV_URL='http://openlist-host:5244/dav'
+WEBDAV_USER='replace-with-your-webdav-user'
+WEBDAV_PASS='replace-with-your-webdav-password'
 
 
 # ==============================
@@ -57,8 +53,7 @@ MAX_PARALLEL_TASKS=2
 # 小于这个大小的视频默认认为异常
 VIDEO_MIN_MB=100
 
-# 大于这个大小的视频默认认为异常
-# 0 = 不限制
+# 大于这个大小的视频默认认为异常；0 = 不限制
 VIDEO_MAX_GB=40
 
 # 大于这个大小的压缩包写入日志
@@ -83,19 +78,18 @@ OPENLIST_REFRESH_INTERVAL=3
 # 安全
 # ==============================
 
-# 如果群晖 OpenSSL 需要 TLS1.2，
-# 这里默认限制最高 TLS1.2。
-# 如果你的环境以后不需要，可以改成：
-# CURL_TLS_MAX=''
+# 如果群晖 OpenSSL 需要 TLS 1.2，默认限制最高 TLS 1.2。
+# 环境不需要限制时可改为：CURL_TLS_MAX=''
 CURL_TLS_MAX='1.2'
 
 # true = 只扫描，不实际转存
 DRY_RUN=false
-WEBDAV_DEFAULT_ROOT="/kuake/其他"
+
+# 未为资源设置 directory 时使用的 WebDAV 根目录
+WEBDAV_DEFAULT_ROOT='/kuake/其他'
 
 RESOURCE_AUTO_ADD=true
 RESOURCE_AUTO_DISCOVER=true
-
 RESOURCE_RECHECK_EXISTING_MAX=3
 RESOURCE_RECHECK_HOURS=24
 RESOURCE_SEEDHUB_ROUNDS=3
@@ -104,13 +98,13 @@ RESOURCE_TASK_MAX=3
 REPLACE_SOURCE_CHECK_MAX=5
 REPLACE_MIN_RATIO=1.30
 REPLACE_MIN_GAIN_MB=500
-
 REPLACE_ENABLED=true
 REPLACE_WINDOW_START_HOUR=2
 REPLACE_WINDOW_END_HOUR=7
 
-LOG_DIR="/root/scripts/quark-follow/logs"
+# 留空以使用脚本目录下的 logs；也可以设为绝对路径。
+LOG_DIR=''
 
-#执行webdav文件同步结果检查的最长等待时间和检查间隔时间
+# 执行 WebDAV 文件同步结果检查的最长等待时间和检查间隔时间
 RESOURCE_ADD_VERIFY_TIMEOUT=200
 RESOURCE_ADD_VERIFY_INTERVAL=10
