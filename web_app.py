@@ -443,11 +443,45 @@ def resource_detail(show_id):
         "SELECT s.*,COUNT(sf.id) file_count,COUNT(DISTINCT sf.episode) episode_count FROM shares s LEFT JOIN share_files sf ON sf.share_id=s.id WHERE s.show_id=? GROUP BY s.id ORDER BY s.seedhub_rank,s.id",
         (show_id,),
     )
-    owned = {r['episode'] for r in db_query(
+    total = show['total_episodes'] or 0
+
+    # webdav_files.episode 使用 SxxEyy 格式；详情页只统计当前资源对应季度。
+    season = 1
+    show_name = str(show.get('name') or '')
+    season_match = re.search(r'第\s*([0-9]+|[零〇兩两一二三四五六七八九十百]+)\s*季', show_name)
+    if season_match:
+        raw = season_match.group(1).replace('兩', '二').replace('〇', '零')
+        if raw.isdigit():
+            season = int(raw)
+        else:
+            cn_digits = {
+                '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+                '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+            }
+            if raw in cn_digits:
+                season = cn_digits[raw]
+    else:
+        season_match = re.search(r'(?i)\bSeason\s*([0-9]{1,2})\b', show_name)
+        if season_match:
+            season = int(season_match.group(1))
+        else:
+            season_match = re.search(r'(?i)(?:^|[^A-Za-z0-9])S\s*([0-9]{1,2})(?:[^A-Za-z0-9]|$)', show_name)
+            if season_match:
+                season = int(season_match.group(1))
+
+    if season < 1:
+        season = 1
+    season_prefix = f'S{season:02d}E'
+    owned = set()
+    for row in db_query(
         "SELECT DISTINCT episode FROM webdav_files WHERE show_id=?",
         (show_id,),
-    )}
-    total = show['total_episodes'] or 0
+    ):
+        episode = str(row.get('episode') or '')
+        match = re.fullmatch(rf'{re.escape(season_prefix)}([0-9]+)', episode)
+        if match:
+            owned.add(int(match.group(1)))
+
     missing = [x for x in range(1, total + 1) if x not in owned]
     return render_template_string(
         BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\\n\\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\\nWebDAV 中已经存在的文件不会删除。\\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
