@@ -41,6 +41,7 @@ LOG_FILE="$LOG_DIR/addfile.log"
 : "${WEBDAV_URL:?config.local 中没有 WEBDAV_URL}"
 : "${WEBDAV_USER:?config.local 中没有 WEBDAV_USER}"
 : "${WEBDAV_PASS:?config.local 中没有 WEBDAV_PASS}"
+OPENLIST_PASSWORD="${OPENLIST_PASSWORD:-}"
 
 QUARK_API_DELAY="${QUARK_API_DELAY:-2}"
 QUARK_TASK_POLL="${QUARK_TASK_POLL:-8}"
@@ -374,61 +375,77 @@ normalize_circled() {
 
 
 # ============================================================
-# 解析 S01E01
+# 解析剧集编号
 # ============================================================
+
+TASK_SEASON=1
+
+extract_season_from_text() {
+    local text="${1:-}"
+    local raw
+    if [[ "$text" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*季 ]]; then
+        raw="${BASH_REMATCH[1]}"
+    elif [[ "$text" =~ [Ss]eason[[:space:]]*([0-9]{1,2}) ]]; then
+        raw="${BASH_REMATCH[1]}"
+    elif [[ "$text" =~ (^|[^A-Za-z0-9])[Ss]([0-9]{1,2})([^A-Za-z0-9]|$) ]]; then
+        raw="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    raw="${raw//兩/二}"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%d' "$((10#$raw))"
+        return 0
+    fi
+    cn_number "$raw"
+}
 
 parse_episode() {
 
     local name="$1"
-    local stem
-    local season=1
-    local episode
-
-    stem="${name%.*}"
+    local context="${2:-}"
+    local stem="${name%.*}"
+    local season="${TASK_SEASON:-1}"
+    local context_season episode season_raw episode_raw
+    local explicit_season=0
 
     stem="$(normalize_circled "$stem")"
 
-    # S01E01 / S1E1 / S01 EP01
     if [[ "$stem" =~ [Ss]([0-9]{1,2})[[:space:]_.-]*[Ee][Pp]?([0-9]{1,4}) ]]; then
-
         season=$((10#${BASH_REMATCH[1]}))
         episode=$((10#${BASH_REMATCH[2]}))
-
-    # E01 / EP01
+        explicit_season=1
     elif [[ "$stem" =~ [Ee][Pp]?([0-9]{1,4}) ]]; then
-
         episode=$((10#${BASH_REMATCH[1]}))
-
     else
-
-        # 第一季
-        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*季 ]]; then
-            season="$(cn_number "${BASH_REMATCH[1]}")" || return 1
+        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*季 ]]; then
+            season_raw="${BASH_REMATCH[1]}"
+            season_raw="${season_raw//兩/二}"
+            season="$(cn_number "$season_raw")" || return 1
+            explicit_season=1
         fi
-
-        # 第01集 / 第1集 / 第一集 / 第①⑤集
-        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*集 ]]; then
-
-            episode="$(cn_number "${BASH_REMATCH[1]}")" || return 1
-
-        # 01.mp4 / 1.mkv / 001.mp4
+        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*集 ]]; then
+            episode_raw="${BASH_REMATCH[1]}"
+            episode_raw="${episode_raw//兩/二}"
+            episode="$(cn_number "$episode_raw")" || return 1
         elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})[[:space:]_.-]*$ ]]; then
-
             episode=$((10#${BASH_REMATCH[1]}))
-
-        # Episode 01
         elif [[ "$stem" =~ [Ee]pisode[[:space:]_.-]*([0-9]{1,4}) ]]; then
-
             episode=$((10#${BASH_REMATCH[1]}))
-
         else
             return 1
         fi
     fi
 
+    if [ "$explicit_season" -eq 0 ] && [ -n "$context" ]; then
+        context_season="$(extract_season_from_text "$context" 2>/dev/null || true)"
+        if [[ "$context_season" =~ ^[0-9]+$ ]] && [ "$context_season" -ge 1 ]; then
+            season="$context_season"
+        fi
+    fi
+
     [ "${season:-0}" -ge 1 ] 2>/dev/null || return 1
     [ "${episode:-0}" -ge 1 ] 2>/dev/null || return 1
-
     printf 'S%02dE%02d' "$season" "$episode"
 }
 
@@ -567,7 +584,7 @@ scan_share_dir() {
             local key
             local ext="${name##*.}"
 
-            key="$(parse_episode "$name" || true)"
+            key="$(parse_episode "$name" "$relative" || true)"
 
             if [ -n "$key" ]; then
 
@@ -668,6 +685,44 @@ openlist_refresh() {
                 page:1,
                 per_page:100
             }')"
+}
+
+
+webdav_wait_available() {
+    local path="$1"
+    local timeout="${RESOURCE_WEBDAV_READY_TIMEOUT:-60}"
+    local interval="${RESOURCE_WEBDAV_READY_INTERVAL:-2}"
+    local deadline now remaining
+
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=60
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=2
+    [ "$interval" -gt 0 ] || interval=1
+
+    if webdav_check "$path"; then
+        return 0
+    fi
+
+    log "WebDAV 尚未看到目标目录，等待同步：$path timeout=${timeout}s"
+    deadline=$(( $(date +%s) + timeout ))
+
+    while :; do
+        now=$(date +%s)
+        [ "$now" -ge "$deadline" ] && break
+
+        if webdav_check "$path"; then
+            log "WebDAV 目标目录已可访问：$path"
+            return 0
+        fi
+
+        remaining=$((deadline-now))
+        if [ "$interval" -lt "$remaining" ]; then
+            sleep "$interval"
+        else
+            sleep "$remaining"
+        fi
+    done
+
+    return 1
 }
 
 
@@ -953,27 +1008,70 @@ process_task() {
 
     local task_name="$1"
     local target="$2"
+    local episode_spec="$3"
 
-    shift 2
+    shift 3
 
     local shares=( "$@" )
+    local task_failed=0
+
+    local -A ALLOWED_EPISODES=()
+    local -a allowed_list=()
+    local allowed_csv allowed_key allowed_season="" allowed_key_season
+
+    case "$episode_spec" in
+        EPISODES=*) allowed_csv="${episode_spec#EPISODES=}" ;;
+        *)
+            error "TASK缺少 EPISODES 白名单：$task_name"
+            return 1
+            ;;
+    esac
+
+    [ -n "$allowed_csv" ] || {
+        error "TASK的 EPISODES 白名单为空：$task_name"
+        return 1
+    }
+
+    IFS=',' read -r -a allowed_list <<< "$allowed_csv"
+
+    for allowed_key in "${allowed_list[@]}"; do
+        if ! [[ "$allowed_key" =~ ^S[0-9]{2}E[0-9]{2}$ ]]; then
+            error "TASK包含非法 episode 白名单：$task_name key=$allowed_key"
+            return 1
+        fi
+        allowed_key_season="${allowed_key:1:2}"
+        if [ -z "$allowed_season" ]; then
+            allowed_season="$allowed_key_season"
+        elif [ "$allowed_key_season" != "$allowed_season" ]; then
+            error "TASK白名单包含多个季度：$task_name episodes=$allowed_csv"
+            return 1
+        fi
+        ALLOWED_EPISODES["$allowed_key"]=1
+    done
+
+    TASK_SEASON=$((10#$allowed_season))
+    [ "$TASK_SEASON" -ge 1 ] || {
+        error "TASK季度非法：$task_name episodes=$allowed_csv"
+        return 1
+    }
 
     local task_dir="$TMP_ROOT/$(printf '%s' "$task_name" | md5sum | cut -d' ' -f1)"
 
     mkdir -p "$task_dir"
 
-    log "TASK开始：$task_name target=$target"
+    log "TASK开始：$task_name target=$target season=S$(printf '%02d' "$TASK_SEASON") allowed=$allowed_csv"
 
     # --------------------------------------------------------
     # target 检查
     # --------------------------------------------------------
 
     if ! openlist_target_exists "$target"; then
-        return
+        return 1
     fi
 
-    if ! webdav_check "$target"; then
-        return
+    if ! webdav_wait_available "$target"; then
+        error "WebDAV目标在等待窗口内仍不可访问：$target"
+        return 1
     fi
 
     # --------------------------------------------------------
@@ -990,7 +1088,7 @@ process_task() {
 
         error "Quark目标目录不存在或无法取得FID：$target"
 
-        return
+        return 1
     fi
 
     # --------------------------------------------------------
@@ -1005,7 +1103,7 @@ process_task() {
 
         error "OpenList刷新失败：$target"
 
-        return
+        return 1
     fi
 
     # --------------------------------------------------------
@@ -1024,9 +1122,11 @@ process_task() {
 
         local key
 
-        key="$(parse_episode "$filename" || true)"
+        key="$(parse_episode "$filename" "$target" || true)"
 
         [ -n "$key" ] || continue
+
+        [ -n "${ALLOWED_EPISODES[$key]+x}" ] || continue
 
         printf '%s\t%s\n' "$key" "$filename" >> "$existing"
 
@@ -1086,6 +1186,9 @@ process_task() {
 
             [ -n "$key" ] || continue
 
+            # 绝对只允许 resource_check 本轮交给 addfile 的缺集。
+            [ -n "${ALLOWED_EPISODES[$key]+x}" ] || continue
+
             # 本地已有
             if awk -F '\t' -v k="$key" '$1 == k {found=1} END {exit !found}' "$existing" 2>/dev/null; then
                 continue
@@ -1141,7 +1244,7 @@ process_task() {
 
         log "TASK完成：$task_name：没有发现缺失集"
 
-        return
+        return 0
     fi
 
 
@@ -1157,7 +1260,6 @@ process_task() {
     local group_id
     local first
 
-    cut -f3 "$selected" | sort -u |
     while IFS= read -r share; do
 
         [ -n "$share" ] || continue
@@ -1182,21 +1284,24 @@ process_task() {
             continue
         fi
 
-        save_group \
+        if ! save_group \
             "$gpwd" \
             "$gstoken" \
             "$target_fid" \
             "$group" \
-            "$share"
+            "$share"; then
+            task_failed=1
+            error "TASK内某个 Share 转存失败：$task_name source=$share"
+        fi
 
-    done
+    done < <(cut -f3 "$selected" | sort -u)
 
 
     if [ "$DRY_RUN" = "true" ]; then
 
         log "TASK结束(DRY RUN)：$task_name"
 
-        return
+        return 0
     fi
 
 
@@ -1227,7 +1332,7 @@ process_task() {
 
         error "转存完成后 OpenList 刷新失败：$target"
 
-        return
+        return 1
     fi
 
 
@@ -1238,7 +1343,10 @@ process_task() {
 
     local qtarget="$task_dir/quark_target"
 
-    quark_target_list "$target_fid" "$qtarget"
+    if ! quark_target_list "$target_fid" "$qtarget"; then
+        error "无法读取 Quark 目标目录：$task_name target=$target"
+        return 1
+    fi
 
 
     # --------------------------------------------------------
@@ -1276,7 +1384,7 @@ process_task() {
 
             local qkey
 
-            qkey="$(parse_episode "$qname" || true)"
+            qkey="$(parse_episode "$qname" "$target" || true)"
 
             if [ "$qkey" = "$key" ]; then
 
@@ -1313,6 +1421,7 @@ process_task() {
         else
 
             error "ADD FAIL：$task_name：重命名失败：$found_name -> $normalized"
+            task_failed=1
 
         fi
 
@@ -1325,7 +1434,13 @@ process_task() {
 
     openlist_refresh "$target" >/dev/null 2>&1 || true
 
+    if [ "$task_failed" -ne 0 ]; then
+        error "TASK结束：$task_name：存在失败操作"
+        return 1
+    fi
+
     log "TASK结束：$task_name"
+    return 0
 }
 
 
@@ -1340,10 +1455,18 @@ if [ ! -f "$TASKS" ]; then
     exit 1
 fi
 
+log "addfile.sh 启动：tasks=$TASKS"
+if [ -s "$TASKS" ]; then
+    log "tasks 内容：$(cat "$TASKS")"
+else
+    log "tasks 为空：本次没有可执行任务"
+    exit 0
+fi
 
 PIDS=()
 PID_NAMES=()
-
+TASK_COUNT=0
+FINAL_RC=0
 
 wait_one() {
 
@@ -1354,91 +1477,73 @@ wait_one() {
         log "并行任务退出：$name OK"
     else
         error "并行任务退出：$name FAIL"
+        FINAL_RC=1
     fi
 }
 
-
 while IFS= read -r line || [ -n "$line" ]; do
 
-    # 去掉开头空格
     line="${line#"${line%%[![:space:]]*}"}"
 
     [ -z "$line" ] && continue
     [[ "$line" == \#* ]] && continue
 
     if [[ "$line" != TASK\|* ]]; then
-
         error "tasks格式错误：$line"
-
+        FINAL_RC=1
         continue
     fi
-
 
     IFS='|' read -r -a parts <<< "$line"
 
-    if [ "${#parts[@]}" -lt 4 ]; then
-
+    if [ "${#parts[@]}" -lt 5 ]; then
         error "tasks字段不足：$line"
-
+        FINAL_RC=1
         continue
     fi
-
 
     task_name="${parts[1]}"
     target="${parts[2]}"
-
-    shares=( "${parts[@]:3}" )
-
+    episode_spec="${parts[3]}"
+    shares=( "${parts[@]:4}" )
 
     if [ -z "$task_name" ]; then
-
         error "任务名称为空"
-
+        FINAL_RC=1
         continue
     fi
-
 
     if [ -z "$target" ]; then
-
         error "target为空：$task_name"
-
+        FINAL_RC=1
         continue
     fi
 
+    TASK_COUNT=$((TASK_COUNT+1))
+    log "提交任务：$task_name"
 
     process_task \
         "$task_name" \
         "$target" \
+        "$episode_spec" \
         "${shares[@]}" &
-
 
     PIDS+=( "$!" )
     PID_NAMES+=( "$task_name" )
 
-
-    # 达到并行上限
     if [ "${#PIDS[@]}" -ge "$MAX_PARALLEL_TASKS" ]; then
-
         wait_one "${PIDS[0]}" "${PID_NAMES[0]}"
-
         PIDS=( "${PIDS[@]:1}" )
         PID_NAMES=( "${PID_NAMES[@]:1}" )
-
     fi
 
 done < "$TASKS"
 
-
-# 等待剩余任务
-
 while [ "${#PIDS[@]}" -gt 0 ]; do
-
     wait_one "${PIDS[0]}" "${PID_NAMES[0]}"
-
     PIDS=( "${PIDS[@]:1}" )
     PID_NAMES=( "${PID_NAMES[@]:1}" )
-
 done
 
-
-log "全部任务处理结束"
+log "全部任务处理结束：task_count=$TASK_COUNT rc=$FINAL_RC"
+exit "$FINAL_RC"

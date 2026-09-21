@@ -14,7 +14,7 @@
 #     ]
 #   }
 #
-# directory 为空/省略：使用 config.local 的 WEBDAV_DEFAULT_ROOT
+# directory 为空/省略：使用 config 的 WEBDAV_DEFAULT_ROOT
 # 例如：
 #   directory="/kuake/电视剧"
 #   SeedHub 标题="test"
@@ -62,6 +62,7 @@ LOCK_DIR="$BASE_DIR/resource_check.lock"
 
 RESOURCE_RESULT="FAILED"
 TARGET_PATH=""
+RESOURCE_SEASON=1
 
 mkdir -p "$TMP_ROOT"
 
@@ -129,6 +130,10 @@ CURL_TLS_MAX="${CURL_TLS_MAX:-1.2}"
 # addfile 返回后必须通过真实 WebDAV 再确认文件已经出现。
 RESOURCE_ADD_VERIFY_TIMEOUT="${RESOURCE_ADD_VERIFY_TIMEOUT:-900}"
 RESOURCE_ADD_VERIFY_INTERVAL="${RESOURCE_ADD_VERIFY_INTERVAL:-10}"
+
+# OpenList 新建/变更目录后，WebDAV 驱动可能需要短暂同步时间。
+RESOURCE_WEBDAV_READY_TIMEOUT="${RESOURCE_WEBDAV_READY_TIMEOUT:-60}"
+RESOURCE_WEBDAV_READY_INTERVAL="${RESOURCE_WEBDAV_READY_INTERVAL:-2}"
 
 # ============================================================
 # 唯一入口：不接受额外参数
@@ -312,6 +317,42 @@ webdav_exists() {
         *) return 1 ;;
     esac
 }
+webdav_wait_available() {
+    local path="$1"
+    local timeout="${RESOURCE_WEBDAV_READY_TIMEOUT:-60}"
+    local interval="${RESOURCE_WEBDAV_READY_INTERVAL:-2}"
+    local deadline now remaining
+
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=60
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=2
+    [ "$interval" -gt 0 ] || interval=1
+
+    if webdav_exists "$path"; then
+        return 0
+    fi
+
+    info "WebDAV 尚未看到目录，等待目录同步：$path timeout=${timeout}s"
+    deadline=$(( $(date +%s) + timeout ))
+
+    while :; do
+        now=$(date +%s)
+        [ "$now" -ge "$deadline" ] && break
+
+        if webdav_exists "$path"; then
+            info "WebDAV 目录已可访问：$path"
+            return 0
+        fi
+
+        remaining=$((deadline-now))
+        if [ "$interval" -lt "$remaining" ]; then
+            sleep "$interval"
+        else
+            sleep "$remaining"
+        fi
+    done
+
+    return 1
+}
 
 openlist_target_exists() {
     local target="$1"
@@ -370,8 +411,8 @@ ensure_webdav_dir() {
         fi
     done
 
-    if ! webdav_exists "$normalized"; then
-        error "OpenList 目录存在，但 WebDAV 仍不可访问：$normalized"
+    if ! webdav_wait_available "$normalized"; then
+        error "OpenList 目录存在，但 WebDAV 在等待窗口内仍不可访问：$normalized"
         return 1
     fi
     return 0
@@ -417,25 +458,108 @@ cn_number() {
     esac
 }
 
+extract_season_from_text() {
+    local text="${1:-}"
+    local raw
+
+    if [[ "$text" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*季 ]]; then
+        raw="${BASH_REMATCH[1]}"
+    elif [[ "$text" =~ [Ss]eason[[:space:]]*([0-9]{1,2}) ]]; then
+        raw="${BASH_REMATCH[1]}"
+    elif [[ "$text" =~ (^|[^A-Za-z0-9])[Ss]([0-9]{1,2})([^A-Za-z0-9]|$) ]]; then
+        raw="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+
+    raw="${raw//兩/二}"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%d' "$((10#$raw))"
+        return 0
+    fi
+    cn_number "$raw"
+}
+
+seasonize_resource_name() {
+    local text="${1:-}"
+    local season="${2:-1}"
+    local base chinese_base
+
+    text="$(printf '%s' "$text" | sed -E 's/[[:space:]]*[-|｜][[:space:]]*SeedHub.*$//I')"
+    text="$(printf '%s' "$text" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -n "$text" ] || return 1
+
+    # 中文标题已经包含“第N季”时，只保留中文标题到季度标记为止。
+    if [[ "$text" =~ ^(.*第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*季) ]]; then
+        base="${BASH_REMATCH[1]}"
+        base="$(printf '%s' "$base" | sed -E 's/[[:space:]]+//g')"
+        [[ "$base" =~ [一-龥] ]] && { printf '%s' "$base"; return 0; }
+    fi
+
+    # 中文标题后带英文片名时，只保留中文标题；S01 单季不强行增加“第1季”。
+    chinese_base="$(printf '%s' "$text" | sed -nE 's/^([一-龥][一-龥[:space:]·・\-—_]*).*/\1/p')"
+    chinese_base="$(printf '%s' "$chinese_base" | sed -E 's/[[:space:]]+//g; s/^[[:space:]–—_|｜-]+//; s/[[:space:]–—_|｜-]+$//')"
+    if [ -n "$chinese_base" ]; then
+        if [ "$season" -gt 1 ] && ! [[ "$chinese_base" =~ 第[一二三四五六七八九十百0-9]+季$ ]]; then
+            printf '%s 第%d季' "$chinese_base" "$season"
+        else
+            printf '%s' "$chinese_base"
+        fi
+        return 0
+    fi
+
+    # 纯英文/混合非中文标题：删除已有 Season/SN 季数，再按季数补中文季度名。
+    base="$(printf '%s' "$text" | sed -E 's/[[:space:]]*Season[[:space:]]*[0-9]{1,2}//Ig; s/(^|[^A-Za-z0-9])[Ss][[:space:]]*[0-9]{1,2}([^A-Za-z0-9]|$)/\1\2/g; s/[[:space:]]{2,}/ /g; s/^[[:space:]–—_|｜-]+//; s/[[:space:]–—_|｜-]+$//')"
+    [ -n "$base" ] || base="$text"
+    if [ "$season" -gt 1 ]; then
+        printf '%s 第%d季' "$base" "$season"
+    else
+        printf '%s' "$base"
+    fi
+}
+
 parse_episode() {
     local name="$1"
+    local context="${2:-}"
     local stem="${name%.*}"
-    local season=1 episode
+    local season="${RESOURCE_SEASON:-1}"
+    local context_season episode season_raw episode_raw
+    local explicit_season=0
+
     stem="$(normalize_circled "$stem")"
 
     if [[ "$stem" =~ [Ss]([0-9]{1,2})[[:space:]_.-]*[Ee][Pp]?([0-9]{1,4}) ]]; then
         season=$((10#${BASH_REMATCH[1]}))
         episode=$((10#${BASH_REMATCH[2]}))
+        explicit_season=1
     elif [[ "$stem" =~ [Ee][Pp]?([0-9]{1,4}) ]]; then
         episode=$((10#${BASH_REMATCH[1]}))
-    elif [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*集 ]]; then
-        episode="$(cn_number "${BASH_REMATCH[1]}")" || return 1
-    elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})[[:space:]_.-]*$ ]]; then
-        episode=$((10#${BASH_REMATCH[1]}))
-    elif [[ "$stem" =~ [Ee]pisode[[:space:]_.-]*([0-9]{1,4}) ]]; then
-        episode=$((10#${BASH_REMATCH[1]}))
     else
-        return 1
+        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*季 ]]; then
+            season_raw="${BASH_REMATCH[1]}"
+            season_raw="${season_raw//兩/二}"
+            season="$(cn_number "$season_raw")" || return 1
+            explicit_season=1
+        fi
+
+        if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零〇兩两一二三四五六七八九十百]+)[[:space:]]*集 ]]; then
+            episode_raw="${BASH_REMATCH[1]}"
+            episode_raw="${episode_raw//兩/二}"
+            episode="$(cn_number "$episode_raw")" || return 1
+        elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})[[:space:]_.-]*$ ]]; then
+            episode=$((10#${BASH_REMATCH[1]}))
+        elif [[ "$stem" =~ [Ee]pisode[[:space:]_.-]*([0-9]{1,4}) ]]; then
+            episode=$((10#${BASH_REMATCH[1]}))
+        else
+            return 1
+        fi
+    fi
+
+    if [ "$explicit_season" -eq 0 ] && [ -n "$context" ]; then
+        context_season="$(extract_season_from_text "$context" 2>/dev/null || true)"
+        if [[ "$context_season" =~ ^[0-9]+$ ]] && [ "$context_season" -ge 1 ]; then
+            season="$context_season"
+        fi
     fi
 
     [ "${season:-0}" -ge 1 ] 2>/dev/null || return 1
@@ -446,6 +570,7 @@ parse_episode() {
 scan_webdav_actual() {
     local target="$1"
     local output="$2"
+    local season="${3:-${RESOURCE_SEASON:-1}}"
     local xml="$TMP_ROOT/webdav-propfind-$$.xml"
     local raw="$TMP_ROOT/webdav-raw-$$.tsv"
 
@@ -483,8 +608,13 @@ for n in r.iter():
     local name size mtime key
     while IFS=$'\t' read -r name size mtime; do
         [ -n "$name" ] || continue
-        key="$(parse_episode "$name" 2>/dev/null || true)"
+        key="$(parse_episode "$name" "$target" 2>/dev/null || true)"
         [ -n "$key" ] || continue
+
+        # WebDAV 缓存保留目标目录中所有可识别季度；
+        # 当前季度隔离只在 get_max_known_episode/get_missing_file/candidate
+        # 等计算阶段完成，不能在这里把其它季度从 webdav_files 中删掉。
+        [[ "$key" =~ ^S[0-9]{2}E[0-9]{2}$ ]] || continue
         [[ "$size" =~ ^[0-9]+$ ]] || size=0
         printf '%s\t%s\t%s\t%s\n' "$key" "$name" "$size" "$mtime" >> "$output"
     done < "$raw"
@@ -534,8 +664,9 @@ scan_webdav_dir() {
         while IFS=$'\t' read -r name size mtime is_dir; do
             [ -n "$name" ] || continue
             [ "$is_dir" = "false" ] || continue
-            key="$(parse_episode "$name" 2>/dev/null || true)"
+            key="$(parse_episode "$name" "$target" 2>/dev/null || true)"
             [ -n "$key" ] || continue
+            [[ "$key" == "$(printf 'S%02dE' "$RESOURCE_SEASON")"* ]] || continue
             [[ "${size:-0}" =~ ^[0-9]+$ ]] || size=0
             printf '%s\t%s\t%s\t%s\n' "$key" "$name" "$size" "$mtime" >> "$output"
         done < <(
@@ -566,17 +697,22 @@ update_webdav_cache() {
     local sql_file="$TMP_ROOT/webdav-write-${show_id}.sql"
     local latest=0 key n
 
-    # latest_episode 取从 E01 开始的最高连续集数，不把中间断集的最大编号误当成最新。
+    # latest_episode 取当前季度从 E01 开始的最高连续集数，
+    # 不把其它季度或中间断集的最大编号误当成最新。
+    local season_prefix
+    printf -v season_prefix 'S%02dE' "$RESOURCE_SEASON"
+
     declare -A present=()
     while IFS=$'\t' read -r key _filename _size _mtime; do
         [ -n "$key" ] || continue
+        [[ "$key" == "$season_prefix"* ]] || continue
         present["$key"]=1
     done < "$scan_file"
 
     local i
     while :; do
         i=$((latest + 1))
-        printf -v key 'S01E%02d' "$i"
+        printf -v key 'S%02dE%02d' "$RESOURCE_SEASON" "$i"
         [ "${present[$key]:-0}" = "1" ] || break
         latest="$i"
     done
@@ -653,12 +789,14 @@ get_max_known_episode() {
     local show_id="$1"
     local webdav_file="${2:-}"
     local share_max=0 webdav_max=0 max=0
+    local season_padded
+    printf -v season_padded '%02d' "$RESOURCE_SEASON"
 
-    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB 'S01E[0-9][0-9]';")"
+    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB 'S${season_padded}E[0-9][0-9]';")"
 
     if [ -n "$webdav_file" ] && [ -s "$webdav_file" ]; then
-        webdav_max="$(awk -F '\t' '
-            $1 ~ /^S01E[0-9][0-9]$/ {
+        webdav_max="$(awk -F '\t' -v prefix="S${season_padded}E" '
+            $1 ~ ("^" prefix "[0-9][0-9]$") {
                 n=substr($1,5)+0
                 if (n>m) m=n
             }
@@ -675,7 +813,7 @@ get_missing_file() {
     : > "$output"
     [ "${max_episode:-0}" -gt 0 ] || return 0
     for ((i=1; i<=max_episode; i++)); do
-        printf -v key 'S01E%02d' "$i"
+        printf -v key 'S%02dE%02d' "$RESOURCE_SEASON" "$i"
         [ -n "${WEBDAV_NAME[$key]+x}" ] || printf '%s\n' "$key" >> "$output"
     done
 }
@@ -742,7 +880,7 @@ FROM (
         s.id,
         s.url,
         COALESCE(s.seedhub_rank,999999) AS seedhub_rank,
-        COUNT(DISTINCT sf_all.episode) AS episode_count
+        COUNT(DISTINCT CASE WHEN sf_all.episode GLOB ('S' || printf('%02d', $RESOURCE_SEASON) || 'E*') THEN sf_all.episode END) AS episode_count
     FROM candidate_shares cs
     JOIN shares s ON s.id=cs.id
     JOIN share_files sf_all ON sf_all.share_id=s.id
@@ -758,21 +896,30 @@ SQL
     sort -t $'\t' -k3,3n -k1,1n "$output" -o "$output" 2>/dev/null || true
 }
 write_task() {
-    local name="$1" target="$2" selected_file="$3"
+    local name="$1" target="$2" selected_file="$3" missing_file="$4"
     local tmp="$TMP_ROOT/tasks.tmp"
-    local line=''
+    local line='' episode_csv='' ep
 
     : > "$tmp"
 
-    # tasks 是当前资源给 addfile.sh 的临时任务。
-    # 没有候选时必须清空，绝不能残留上一个资源的任务。
+    # tasks 必须带本轮明确缺集白名单；addfile.sh 将严格按该名单转存。
     if [ -s "$selected_file" ]; then
-        line="TASK|$name|$target"
-        while IFS=$'\t' read -r _sid url _rank; do
-            [ -n "$url" ] || continue
-            line+="|$url"
-        done < "$selected_file"
-        printf '%s\n' "$line" > "$tmp"
+        while IFS= read -r ep; do
+            [ -n "$ep" ] || continue
+            [ -n "$episode_csv" ] && episode_csv+=","
+            episode_csv+="$ep"
+        done < "$missing_file"
+
+        if [ -z "$episode_csv" ]; then
+            warn "[$name] 有候选 Share，但缺集白名单为空，拒绝生成补缺任务"
+        else
+            line="TASK|$name|$target|EPISODES=$episode_csv"
+            while IFS=$'\t' read -r _sid url _rank; do
+                [ -n "$url" ] || continue
+                line+="|$url"
+            done < "$selected_file"
+            printf '%s\n' "$line" > "$tmp"
+        fi
     fi
 
     mv -f "$tmp" "$TASKS"
@@ -937,9 +1084,12 @@ queue_replacements() {
     local show_id="$1" show_name="$2"
     local all_file="$3" best_file="$TMP_ROOT/repl-best-${show_id}.tsv"
     local episode sid source_file rank new_size old_file old_size gain need_ratio threshold existing pending_new
+    local season_padded season_pattern
+    printf -v season_padded '%02d' "$RESOURCE_SEASON"
+    season_pattern="S${season_padded}E*"
 
     sqlite3 -tabs "$DB" \
-        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB $(sql_quote "$season_pattern") ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$all_file"
 
     awk -F '\t' '!seen[$1]++ {print}' "$all_file" > "$best_file"
@@ -1068,6 +1218,27 @@ process_resource() {
 
     info "[$resource_name] show_id=$show_id total_episodes=$total share_scan_rank=$old_rank"
 
+    # 单季剧的一级标题没有季度标记时，按 S01 处理；季度信息不是继续流程的硬门槛。
+    RESOURCE_SEASON="$(extract_season_from_text "$resource_name" 2>/dev/null || printf '1')"
+    if ! [[ "$RESOURCE_SEASON" =~ ^[0-9]+$ ]] || [ "$RESOURCE_SEASON" -lt 1 ]; then
+        RESOURCE_SEASON=1
+    fi
+
+    # 即使数据库中残留旧的长名称，也在这里重新规范化，避免错误目录名阻塞后续 WebDAV / addfile 流程。
+    resource_name="$(seasonize_resource_name "$resource_name" "$RESOURCE_SEASON" 2>/dev/null || printf '%s' "$resource_name")"
+    if [ -z "$resource_name" ]; then
+        error "无法生成有效资源名称：show_id=$show_id"
+        return 1
+    fi
+    sqlite3 "$DB" \
+        "UPDATE shows SET name=$(sql_quote "$resource_name"),updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$show_id");"
+
+    if [ "$RESOURCE_SEASON" -eq 1 ] && ! extract_season_from_text "$resource_name" >/dev/null 2>&1; then
+        info "[$resource_name] 未检测到显式季度标记，按单季剧处理：S01"
+    else
+        info "[$resource_name] 当前季度上下文：S$(printf '%02d' "$RESOURCE_SEASON")"
+    fi
+
     if ! sync_show_path "$show_id" "$resource_name" "$directory"; then
         return 1
     fi
@@ -1137,7 +1308,7 @@ process_resource() {
     fi
 
     if [ "$known_max" -eq 0 ]; then
-        write_task "$resource_name" "$target" /dev/null
+        write_task "$resource_name" "$target" /dev/null "$missing_file"
         warn "[$resource_name] !!! 强提醒：当前没有任何 Share 被识别出可用剧集文件；SeedHub 标注总集数=$total，但当前无法建立可补缺范围。"
         status='UNRESOLVED'
         RESOURCE_RESULT="$status"
@@ -1229,7 +1400,7 @@ process_resource() {
     build_candidates "$show_id" "$missing_file" "$candidate_file"
     select_task_shares "$show_id" "$candidate_file" "$missing_file" "$selected_file"
     unresolved="$(count_unresolved "$missing_file" "$candidate_file")"
-    write_task "$resource_name" "$target" "$selected_file"
+    write_task "$resource_name" "$target" "$selected_file" "$missing_file"
 
     if [ -s "$selected_file" ]; then
         info "[$resource_name] 自动生成 tasks：$(cut -f2 "$selected_file" | tr '\n' ' ')"
