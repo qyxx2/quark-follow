@@ -19,6 +19,8 @@ RESOURCES = BASE / "resources.json"
 CONFIG = BASE / "config.local"
 LOG_DIR = BASE / "logs"
 LOCKS = {"resource_check": BASE / "resource_check.lock", "replace": BASE / "replace.lock"}
+WEB_RESTART_SCRIPT = BASE / "restart-web.sh"
+WEB_RESTART_LOCK = BASE / "web-restart.lock"
 USERNAME = os.environ.get("QUARK_WEB_USERNAME")
 PASSWORD = os.environ.get("QUARK_WEB_PASSWORD")
 if not USERNAME or not PASSWORD:
@@ -32,6 +34,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get("QUARK_WEB_HTTPS") == "1",
 )
 launch_lock = threading.Lock()
+web_restart_requested = False
 SENSITIVE = {"QUARK_COOKIE", "OPENLIST_TOKEN", "OPENLIST_PASSWORD", "WEBDAV_PASS"}
 LOG_CATEGORIES = {"ALL", "PARSE", "SCAN", "ADD", "REPLACE", "DELETE", "EXCLUDE", "CHECK", "INIT", "WARN", "ERROR"}
 CONFIG_FIELDS = [
@@ -365,6 +368,7 @@ def dashboard_data():
         "queue": {x: counts.get(x, 0) for x in ("pending", "running", "success", "failed")},
         "last_run": latest["time"],
         "last_result": latest["result"],
+        "web_pid": os.getpid(),
         "events": log_events(12),
     }
 
@@ -411,13 +415,105 @@ def logout():
 @login_required
 def index():
     return render_template_string(
-        BASE_TEMPLATE + """<h1>系统概览</h1><div id='dashboard'></div><p class='muted'>页面每 3 秒刷新；运行状态根据实际锁目录及进程检测。</p><script>const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));async function load(){let d=await fetch('/api/dashboard').then(r=>r.json());let t=d.tasks.resource_check;let q=d.queue;document.querySelector('#dashboard').innerHTML=`<div class=grid><div class=card><div class=label>resource_check</div><div class="metric ${t.running?'warn':'ok'}">${t.running?'运行中':'空闲'}</div><div class=label>${t.pid?'PID '+t.pid:'无进程'}</div></div><div class=card><div class=label>剧集数量</div><div class=metric>${d.show_count}</div></div><div class=card><div class=label>Share / dead</div><div class=metric>${d.share_count} / ${d.dead_shares}</div></div><div class=card><div class=label>替换队列</div><div>pending ${q.pending} · running ${q.running}<br>success ${q.success} · failed ${q.failed}</div></div></div><div class=card><div class=label>最近一次 resource_check</div>${d.last_run||'暂无'} · ${d.last_result}<div class=actions style="margin-top:12px"><form method=post action='/tasks/resource-check'><button ${t.running?'disabled':''}>立即运行 resource_check</button></form></div></div><section class=card><h2>最近事件</h2>${d.events.map(e=>`<div class=event><span class=tag>${e.category}</span> <span class=muted>${esc(e.time)} ${esc(e.source)}</span><br>${esc(e.message)}</div>`).join('')||'暂无日志'}</section>`}load();setInterval(load,3000)</script></main>"""
+        BASE_TEMPLATE + """<h1>系统概览</h1><div id='dashboard'></div><p class='muted'>页面每 3 秒刷新；运行状态根据实际锁目录及进程检测。</p><script>
+let webRestarting=false;
+const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function waitForWeb(oldPid){
+  for(let i=0;i<45;i++){
+    await sleep(1000);
+    try{
+      const r=await fetch('/api/dashboard?restart_probe='+Date.now(),{cache:'no-store'});
+      if(r.ok){
+        const d=await r.json();
+        if(Number(d.web_pid)!==Number(oldPid)){
+          location.reload();
+          return;
+        }
+      }
+    }catch(e){}
+  }
+  const btn=document.querySelector('#web-restart');
+  if(btn){btn.disabled=false;btn.textContent='重新尝试重启 Web 服务';}
+  webRestarting=false;
+}
+async function restartWeb(oldPid){
+  if(webRestarting)return;
+  if(!confirm('确定要重启 Web 服务吗？\\n\\n重启过程中网页会短暂断开。\\nresource_check、source_check、addfile、replace 等后台任务不会被停止。'))return;
+  webRestarting=true;
+  const btn=document.querySelector('#web-restart');
+  if(btn){btn.disabled=true;btn.textContent='正在重启…';}
+  try{
+    const r=await fetch('/tasks/web-restart',{method:'POST'});
+    if(!r.ok){
+      let msg='Web 重启请求失败。';
+      try{const d=await r.json();if(d.message)msg=d.message;}catch(e){}
+      if(state)state.textContent=msg;
+      if(btn){btn.disabled=false;btn.textContent='重启 Web 服务';}
+      webRestarting=false;
+      return;
+    }
+    await waitForWeb(oldPid);
+  }catch(e){
+    await waitForWeb(oldPid);
+  }
+}
+async function load(){
+  if(webRestarting)return;
+  try{
+    let d=await fetch('/api/dashboard?ts='+Date.now(),{cache:'no-store'}).then(r=>r.json());
+    let t=d.tasks.resource_check;let q=d.queue;
+    document.querySelector('#dashboard').innerHTML=`
+      <div class=grid>
+        <div class=card><div class=label>Web 服务</div><div class="metric ok">运行中</div><div class=label>PID ${d.web_pid||'未知'} · 端口 5233</div><div class=actions style="margin-top:12px"><button id=web-restart onclick="restartWeb(${Number(d.web_pid)||0})">重启 Web 服务</button></div></div>
+        <div class=card><div class=label>resource_check</div><div class="metric ${t.running?'warn':'ok'}">${t.running?'运行中':'空闲'}</div><div class=label>${t.pid?'PID '+t.pid:'无进程'}</div></div>
+        <div class=card><div class=label>剧集数量</div><div class=metric>${d.show_count}</div></div>
+        <div class=card><div class=label>Share / dead</div><div class=metric>${d.share_count} / ${d.dead_shares}</div></div>
+        <div class=card><div class=label>替换队列</div><div>pending ${q.pending} · running ${q.running}<br>success ${q.success} · failed ${q.failed}</div></div>
+      </div>
+      <div class=card><div class=label>最近一次 resource_check</div>${d.last_run||'暂无'} · ${d.last_result}<div class=actions style="margin-top:12px"><form method=post action='/tasks/resource-check'><button ${t.running?'disabled':''}>立即运行 resource_check</button></form></div></div>
+      <section class=card><h2>最近事件</h2>${d.events.map(e=>`<div class=event><span class=tag>${e.category}</span> <span class=muted>${esc(e.time)} ${esc(e.source)}</span><br>${esc(e.message)}</div>`).join('')||'暂无日志'}</section>`;
+  }catch(e){}
+}
+load();setInterval(load,3000);
+</script></main>"""
     )
 
 @app.route('/api/dashboard')
 @login_required
 def api_dashboard():
     return jsonify(dashboard_data())
+
+@app.post('/tasks/web-restart')
+@login_required
+def restart_web():
+    global web_restart_requested
+    current_pid = os.getpid()
+    with launch_lock:
+        if web_restart_requested or WEB_RESTART_LOCK.exists():
+            return jsonify({"ok": False, "message": "已有 Web 重启任务正在执行，请等待当前重启完成。"}), 409
+        if not WEB_RESTART_SCRIPT.is_file():
+            write_web_log("ERROR", f"Web 重启请求失败：脚本不存在：{WEB_RESTART_SCRIPT}")
+            return jsonify({"ok": False, "message": "restart-web.sh 不存在，未执行重启。"}), 500
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        restart_launcher_log = LOG_DIR / "web_restart_launcher.log"
+        write_web_log("INIT", f"收到 Web 重启请求：current_pid={current_pid}")
+        try:
+            with restart_launcher_log.open("ab") as output:
+                child = subprocess.Popen(
+                    [str(WEB_RESTART_SCRIPT), str(current_pid)],
+                    cwd=BASE,
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            web_restart_requested = True
+        except OSError as exc:
+            write_web_log("ERROR", f"Web 重启启动器启动失败：current_pid={current_pid} error={exc}")
+            return jsonify({"ok": False, "message": f"无法启动重启脚本：{exc}"}), 500
+    return jsonify({"ok": True, "message": "Web 服务正在重启。", "launcher_pid": child.pid})
 
 @app.route('/resources')
 @login_required
