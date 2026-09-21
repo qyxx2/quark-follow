@@ -63,6 +63,7 @@ LOCK_DIR="$BASE_DIR/resource_check.lock"
 RESOURCE_RESULT="FAILED"
 TARGET_PATH=""
 RESOURCE_SEASON=1
+WEBDAV_STATE_VALID=0
 
 mkdir -p "$TMP_ROOT"
 
@@ -624,73 +625,6 @@ for n in r.iter():
     return 0
 }
 
-scan_webdav_dir() {
-    local target="$1"
-    local output="$2"
-    local page=1 per_page=100
-    local result count total name size mtime key is_dir
-
-    : > "$output"
-
-    if ! webdav_exists "$target"; then
-        error "WebDAV 目录不可访问：$target"
-        return 1
-    fi
-
-    while :; do
-        result="$(
-            openlist_curl \
-                -X POST \
-                "$OPENLIST_URL/api/fs/list" \
-                --data "$(jq -nc \
-                    --arg p "$target" \
-                    --arg pw "$OPENLIST_PASSWORD" \
-                    --argjson pg "$page" \
-                    --argjson pp "$per_page" \
-                    --argjson rf "$([ "$page" -eq 1 ] && echo true || echo false)" \
-                    '{path:$p,password:$pw,refresh:$rf,page:$pg,per_page:$pp}')"
-        )" || return 1
-
-        if ! printf '%s' "$result" | jq -e . >/dev/null 2>&1; then
-            error "OpenList 返回非 JSON：$target page=$page"
-            return 1
-        fi
-
-        if [ "$(printf '%s' "$result" | jq -r '.code // 0')" != "200" ]; then
-            error "OpenList 列目录失败：$target page=$page message=$(printf '%s' "$result" | jq -r '.message // "unknown"')"
-            return 1
-        fi
-
-        while IFS=$'\t' read -r name size mtime is_dir; do
-            [ -n "$name" ] || continue
-            [ "$is_dir" = "false" ] || continue
-            key="$(parse_episode "$name" "$target" 2>/dev/null || true)"
-            [ -n "$key" ] || continue
-            [[ "$key" == "$(printf 'S%02dE' "$RESOURCE_SEASON")"* ]] || continue
-            [[ "${size:-0}" =~ ^[0-9]+$ ]] || size=0
-            printf '%s\t%s\t%s\t%s\n' "$key" "$name" "$size" "$mtime" >> "$output"
-        done < <(
-            printf '%s' "$result" |
-            jq -r '.data.content[]? | [(.name // ""),(.size // 0),(.modified // .mtime // .updated_at // ""),(.is_dir // false)] | @tsv'
-        )
-
-        count="$(printf '%s' "$result" | jq '.data.content | length')"
-        total="$(printf '%s' "$result" | jq '.data.total // .data.count // 0')"
-        [ "$count" -eq 0 ] && break
-
-        if [ "$total" -gt 0 ]; then
-            [ $((page * per_page)) -ge "$total" ] && break
-        elif [ "$count" -lt "$per_page" ]; then
-            break
-        fi
-
-        page=$((page + 1))
-    done
-
-    sort -u "$output" -o "$output" 2>/dev/null || true
-    return 0
-}
-
 update_webdav_cache() {
     local show_id="$1"
     local scan_file="$2"
@@ -717,51 +651,91 @@ update_webdav_cache() {
         latest="$i"
     done
 
+    # WebDAV 扫描结果是“事实快照”，但本地 webdav_files 不再整表删除/重建。
+    # 只同步新增、变化、删除的记录；整个同步过程保持在一个事务内。
+    # 这样可以保持缓存最终结果与扫描快照一致，同时避免大量无意义 SQLite 写入。
     {
+        printf '.bail on\n'
         printf '%s\n' "$SQL_BUSY_TIMEOUT"
         printf 'BEGIN IMMEDIATE;\n'
-        printf 'DELETE FROM webdav_files WHERE show_id=%s;\n' "$(sql_quote "$show_id")"
+        printf 'DROP TABLE IF EXISTS temp.incoming_webdav;\n'
+        printf 'CREATE TEMP TABLE incoming_webdav (episode TEXT NOT NULL, filename TEXT NOT NULL, size INTEGER, mtime TEXT, PRIMARY KEY (episode, filename));\n'
+        printf '.mode tabs\n'
+        printf '.import %q incoming_webdav\n' "$scan_file"
 
-        while IFS=$'\t' read -r key name size mtime; do
-            [ -n "$key" ] || continue
-            printf 'INSERT INTO webdav_files (show_id,episode,filename,size,mtime,last_check,source_share_id) VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,NULL);\n' \
-                "$(sql_quote "$show_id")" \
-                "$(sql_quote "$key")" \
-                "$(sql_quote "$name")" \
-                "${size:-0}" \
-                "$(sql_quote "${mtime:-}")"
-        done < "$scan_file"
+        # 只更新真正发生变化的 WebDAV 文件。
+        # 文件发生变化时先清空 source_share_id，随后按现有规则重新回填，
+        # 避免沿用已经过期的来源 Share。
+        printf 'UPDATE webdav_files\n'
+        printf 'SET size=(SELECT i.size FROM incoming_webdav i WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename),\n'
+        printf '    mtime=(SELECT i.mtime FROM incoming_webdav i WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename),\n'
+        printf '    last_check=CURRENT_TIMESTAMP,\n'
+        printf '    source_share_id=NULL\n'
+        printf 'WHERE show_id=%s\n' "$(sql_quote "$show_id")"
+        printf '  AND EXISTS (SELECT 1 FROM incoming_webdav i WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename)\n'
+        printf '  AND (\n'
+        printf '      COALESCE(size,0) != COALESCE((SELECT i.size FROM incoming_webdav i WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename),0)\n'
+        printf '      OR COALESCE(mtime,\x27\x27) != COALESCE((SELECT i.mtime FROM incoming_webdav i WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename),\x27\x27)\n'
+        printf '  );\n'
+
+        # 只插入本次扫描中新出现的文件；新增记录保持与原实现相同的 NULL 来源，
+        # 后面的 source_share_id 回填逻辑会按现有优先级选出来源 Share。
+        printf 'INSERT INTO webdav_files (show_id,episode,filename,size,mtime,last_check,source_share_id)\n'
+        printf 'SELECT %s,i.episode,i.filename,COALESCE(i.size,0),COALESCE(i.mtime,\x27\x27),CURRENT_TIMESTAMP,NULL\n' "$(sql_quote "$show_id")"
+        printf 'FROM incoming_webdav i\n'
+        printf 'WHERE NOT EXISTS (\n'
+        printf '    SELECT 1 FROM webdav_files w\n'
+        printf '    WHERE w.show_id=%s AND w.episode=i.episode AND w.filename=i.filename\n' "$(sql_quote "$show_id")"
+        printf ');\n'
+
+        # 删除已从实际 WebDAV 目录消失的文件。这个操作是必要的，
+        # 否则缓存会保留已经不存在的文件并错误影响缺集/替换判断。
+        printf 'DELETE FROM webdav_files\n'
+        printf 'WHERE show_id=%s\n' "$(sql_quote "$show_id")"
+        printf '  AND NOT EXISTS (\n'
+        printf '      SELECT 1 FROM incoming_webdav i\n'
+        printf '      WHERE i.episode=webdav_files.episode AND i.filename=webdav_files.filename\n'
+        printf '  );\n'
+
+        # 保持原有 source_share_id 选择规则：只为 NULL 来源重新回填，
+        # 按有效 Share、SeedHub rank、share id 的顺序选择最优来源。
+        printf 'UPDATE webdav_files\n'
+        printf 'SET source_share_id = (\n'
+        printf '    SELECT sf.share_id\n'
+        printf '    FROM share_files sf\n'
+        printf '    JOIN shares ss ON ss.id=sf.share_id\n'
+        printf '    WHERE ss.show_id=webdav_files.show_id\n'
+        printf '      AND sf.episode=webdav_files.episode\n'
+        printf '      AND sf.filename=webdav_files.filename\n'
+        printf '      AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)\n'
+        printf '      AND COALESCE(ss.status,\x27unknown\x27) NOT IN (\x27dead\x27,\x27excluded\x27)\n'
+        printf '    ORDER BY COALESCE(ss.seedhub_rank,999999), ss.id\n'
+        printf '    LIMIT 1\n'
+        printf ')\n'
+        printf 'WHERE show_id=%s AND source_share_id IS NULL\n' "$(sql_quote "$show_id")"
+        printf '  AND EXISTS (\n'
+        printf '      SELECT 1\n'
+        printf '      FROM share_files sf\n'
+        printf '      JOIN shares ss ON ss.id=sf.share_id\n'
+        printf '      WHERE ss.show_id=webdav_files.show_id\n'
+        printf '        AND sf.episode=webdav_files.episode\n'
+        printf '        AND sf.filename=webdav_files.filename\n'
+        printf '        AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)\n'
+        printf '        AND COALESCE(ss.status,\x27unknown\x27) NOT IN (\x27dead\x27,\x27excluded\x27)\n'
+        printf '  );\n'
 
         printf 'UPDATE shows SET latest_episode=%s,last_scan=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=%s;\n' \
             "$latest" "$(sql_quote "$show_id")"
         printf 'COMMIT;\n'
     } > "$sql_file"
 
+    # .bail on + 单事务保证：任何导入/同步/更新失败时，SQLite 不会提交半套缓存。
     if ! sqlite3 "$DB" < "$sql_file"; then
-        error "写入 webdav_files 失败：show_id=$show_id"
+        error "增量更新 webdav_files 失败：show_id=$show_id"
         return 1
     fi
 
-    # 已存在文件可按“文件名 + 大小”与 share_files 做安全的 source_share_id 回填。
-    sqlite3 "$DB" <<SQL >/dev/null 2>&1 || true
-$SQL_BUSY_TIMEOUT
-UPDATE webdav_files
-SET source_share_id = (
-    SELECT sf.share_id
-    FROM share_files sf
-    JOIN shares ss ON ss.id=sf.share_id
-    WHERE ss.show_id=webdav_files.show_id
-      AND sf.episode=webdav_files.episode
-      AND sf.filename=webdav_files.filename
-      AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)
-      AND COALESCE(ss.status,'unknown') NOT IN ('dead','excluded')
-    ORDER BY COALESCE(ss.seedhub_rank,999999), ss.id
-    LIMIT 1
-)
-WHERE show_id=$(sql_quote "$show_id")
-  AND source_share_id IS NULL;
-SQL
-
+    rm -f "$sql_file"
     return 0
 }
 
@@ -1170,7 +1144,13 @@ verify_addfile_webdav() {
 
     while :; do
         if scan_webdav_actual "$target" "$webdav_file"; then
-            update_webdav_cache "$show_id" "$webdav_file" || true
+            if update_webdav_cache "$show_id" "$webdav_file"; then
+                WEBDAV_STATE_VALID=1
+            else
+                # 扫描本身成功但本地缓存同步失败时，不把缓存标记为最新；
+                # 即使本轮远端验证可以继续，资源流程结束前仍会强制再同步一次。
+                WEBDAV_STATE_VALID=0
+            fi
             load_webdav_best "$webdav_file"
             get_missing_file "$total" "$actual_missing_file"
             count="$(awk 'NR==FNR { missing[$1]=1; next } ($1 in missing) { c++ } END { print c+0 }' "$expected_file" "$actual_missing_file")"
@@ -1195,6 +1175,7 @@ verify_addfile_webdav() {
 process_resource() {
     local url="$1" directory="$2"
     RESOURCE_RESULT="FAILED"
+    WEBDAV_STATE_VALID=0
     local show_id resource_name total current_path target old_rank
     local webdav_file missing_file candidate_file selected_file recheck_file
     local missing_count_val unresolved
@@ -1262,9 +1243,14 @@ process_resource() {
     recheck_file="$TMP_ROOT/recheck-${show_id}.txt"
 
     if ! scan_webdav_actual "$target" "$webdav_file"; then
+        WEBDAV_STATE_VALID=0
         return 1
     fi
-    update_webdav_cache "$show_id" "$webdav_file" || return 1
+    if ! update_webdav_cache "$show_id" "$webdav_file"; then
+        WEBDAV_STATE_VALID=0
+        return 1
+    fi
+    WEBDAV_STATE_VALID=1
     load_webdav_best "$webdav_file"
 
     if [ "$total" -le 0 ]; then
@@ -1450,7 +1436,11 @@ process_resource() {
         refresh_replacement_sources "$show_id" "$resource_name" "$replace_shares"
 
         if scan_webdav_actual "$target" "$webdav_file"; then
-            update_webdav_cache "$show_id" "$webdav_file" || true
+            if update_webdav_cache "$show_id" "$webdav_file"; then
+                WEBDAV_STATE_VALID=1
+            else
+                WEBDAV_STATE_VALID=0
+            fi
             load_webdav_best "$webdav_file"
             queue_replacements "$show_id" "$resource_name" "$TMP_ROOT/repl-all-${show_id}.tsv"
         else
@@ -1460,6 +1450,9 @@ process_resource() {
         if [ -f "$REPLACE_SH" ]; then
             if sqlite3 "$DB" "SELECT 1 FROM replace_queue WHERE show_id=$(sql_quote "$show_id") AND status='pending' LIMIT 1;" | grep -qx 1; then
                 info "[$resource_name] 调用 replace.sh 执行 pending 替换"
+                # 只要真正启动 replace.sh，就认为远端 WebDAV 可能已经发生变化；
+                # 最终状态阶段必须重新做一次实际扫描。
+                WEBDAV_STATE_VALID=0
                 if ! bash "$REPLACE_SH" >> "$LOG_FILE" 2>&1; then
                     warn "[$resource_name] replace.sh 返回失败，请查看日志"
                 fi
@@ -1476,9 +1469,21 @@ process_resource() {
     # --------------------------------------------------------
     # 7. 最终状态
     # --------------------------------------------------------
-    if scan_webdav_actual "$target" "$webdav_file"; then
-        update_webdav_cache "$show_id" "$webdav_file" || true
-        load_webdav_best "$webdav_file"
+    # 只有本轮确实可能改变 WebDAV，或之前的扫描/缓存同步未成功时，
+    # 才重新做最终实际扫描。source_check / DB 候选计算本身不会改变 WebDAV。
+    if [ "${WEBDAV_STATE_VALID:-0}" -ne 1 ]; then
+        if scan_webdav_actual "$target" "$webdav_file"; then
+            if update_webdav_cache "$show_id" "$webdav_file"; then
+                WEBDAV_STATE_VALID=1
+            else
+                WEBDAV_STATE_VALID=0
+            fi
+            load_webdav_best "$webdav_file"
+        else
+            WEBDAV_STATE_VALID=0
+        fi
+    else
+        info "[$resource_name] WebDAV 状态未发生变化，跳过无意义的最终重复扫描"
     fi
 
     known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
