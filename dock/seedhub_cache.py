@@ -19,9 +19,40 @@ BASE_URL = "https://www.seedhub.cc"
 DB_FILE = "/data/resource.db"
 LOG_FILE = Path("/data/logs/seedhub_cache.log")
 
+SCAN_BATCH_SIZE = 20
+PAGE_TIMEOUT = 60000
+PAGE_DELAY = 2
+
+CN_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+ROMAN_SEASONS = {
+    "Ⅰ": 1,
+    "Ⅱ": 2,
+    "Ⅲ": 3,
+    "Ⅳ": 4,
+    "Ⅴ": 5,
+    "Ⅵ": 6,
+    "Ⅶ": 7,
+    "Ⅷ": 8,
+    "Ⅸ": 9,
+    "Ⅹ": 10,
+}
+
 
 def log_print(*args, **kwargs):
-    """Mirror parser output to the shared log directory with a queryable tag."""
     builtins.print(*args, **kwargs)
     separator = kwargs.get("sep", " ")
     end = kwargs.get("end", "\n")
@@ -36,50 +67,25 @@ def log_print(*args, **kwargs):
 
 print = log_print
 
-# 每次最多新增扫描多少个 SeedHub 分享
-SCAN_BATCH_SIZE = 20
-
-# Playwright 页面超时时间
-PAGE_TIMEOUT = 60000
-
-# 两个二级页面之间的间隔
-PAGE_DELAY = 2
-
 
 # ============================================================
 # 文本处理
 # ============================================================
 
 def normalize_text(text):
-    """
-    清理 SeedHub 页面提取出来的文本。
-
-    SeedHub 的中文文本通过 inner_text() 获取后，
-    经常会出现：
-
-        云 雀 叫 天 录
-
-    这种字符之间带空格的情况。
-
-    对连续中文字符之间的空格进行清理。
-    """
-
     if not text:
         return ""
 
     text = text.replace("\r", "\n")
 
-    # 去掉中文字符之间的空白
     text = re.sub(
         r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])',
         '',
         text
     )
 
-    # 多个普通空白压缩成一个
     text = re.sub(r'[ \t]+', ' ', text)
 
-    # 清理每一行两端
     lines = []
 
     for line in text.splitlines():
@@ -92,33 +98,216 @@ def normalize_text(text):
 
 
 # ============================================================
-# 获取剧名
+# 季数解析
+#
+# 一级页面才负责确定当前季。
+# 不读取 body 中的普通文本，因为正文可能同时提到其它季。
 # ============================================================
 
+def parse_number_token(value):
+    value = (value or "").strip().replace("〇", "零").replace("兩", "两")
+
+    if value.isdigit():
+        return int(value)
+
+    if value in CN_DIGITS:
+        return CN_DIGITS[value]
+
+    if all(ch in CN_DIGITS for ch in value):
+        number = 0
+        for ch in value:
+            number = number * 10 + CN_DIGITS[ch]
+        return number
+
+    if "百" in value:
+        left, right = value.split("百", 1)
+        hundreds = 1 if not left else parse_number_token(left)
+        remainder = parse_number_token(right) if right else 0
+        return hundreds * 100 + remainder
+
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = 1 if not left else parse_number_token(left)
+        remainder = parse_number_token(right) if right else 0
+        return tens * 10 + remainder
+
+    raise ValueError(f"无法解析数字：{value}")
+
+
+def season_markers(text):
+    if not text:
+        return []
+
+    patterns = [
+        r'第\s*([0-9]+|[零〇兩两一二三四五六七八九十百]+)\s*季',
+        r'\bSeason\s*([0-9]{1,2})\b',
+        r'(?<![A-Za-z0-9])[Ss]([0-9]{1,2})(?![A-Za-z0-9])',
+    ]
+
+    found = []
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            number = parse_number_token(match.group(1))
+            if number >= 1:
+                found.append(number)
+
+    return found
+
+
+def detect_season(page, movie_url, primary_title):
+    """
+    先判断一级页面主标题；主标题没有季号时，再看 title / URL。
+    没有明确季号时按第1季处理。
+    """
+    primary_found = season_markers(primary_title)
+    primary_unique = sorted(set(primary_found))
+
+    if len(primary_unique) > 1:
+        raise ValueError(
+            f"一级 SeedHub 主标题季度信号冲突：{primary_title!r} -> "
+            + ", ".join(f"第{season}季" for season in primary_unique)
+        )
+
+    if len(primary_unique) == 1:
+        return primary_unique[0]
+
+    sources = []
+
+    try:
+        title = normalize_text(page.title())
+        if title and title != primary_title:
+            sources.append(("title", title))
+    except Exception:
+        pass
+
+    sources.append(("url", movie_url))
+
+    found = []
+    for source, value in sources:
+        for season in season_markers(value):
+            found.append((season, source, value))
+
+    unique = sorted({season for season, _, _ in found})
+
+    if not unique:
+        return 1
+
+    if len(unique) != 1:
+        details = "; ".join(
+            f"{source}={value!r}->第{season}季"
+            for season, source, value in found
+        )
+        raise ValueError(f"一级 SeedHub 补充季度信号冲突：{details}")
+
+    return unique[0]
+
+def remove_season_markers(text):
+    text = text or ""
+
+    text = re.sub(
+        r'第\s*(?:[0-9]+|[零〇一二两三四五六七八九十百]+)\s*季',
+        '',
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r'(?<![A-Za-z0-9])Season\s*[0-9]{1,2}(?![0-9])',
+        '',
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r'(?<![A-Za-z0-9])[Ss]\s*[0-9]{1,2}(?![0-9])',
+        '',
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r'시즌\s*[0-9]{1,2}',
+        '',
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r'[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]\s*$',
+        '',
+        text
+    )
+
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = text.strip(' -–—_|｜')
+
+    return text.strip()
+
+
+def seasonize_show_name(show_name, season):
+    """
+    生成统一的短资源名称。
+
+    优先保留一级页面中的中文剧名及其中文季度写法，例如：
+        绅士们第二季 The Gentlemen Season 2
+        -> 绅士们第二季
+
+    如果中文标题本身没有季度标记，则在中文标题后补“第N季”。
+    纯英文标题则去掉英文 Season/SN 标记后补“第N季”。
+    """
+    text = normalize_text(show_name)
+
+    if not text:
+        return ""
+
+    # 页面可能把站点名称拼在标题尾部。
+    text = re.sub(
+        r'\s*[-|｜]\s*SeedHub.*$',
+        '',
+        text,
+        flags=re.I
+    ).strip()
+
+    # 最优先：中文标题自身已经带“第N季”。
+    chinese_season = re.match(
+        r'^(.*?第\s*(?:[0-9]+|[零〇一二两三四五六七八九十百]+)\s*季)',
+        text,
+        re.I
+    )
+    if chinese_season:
+        base = normalize_text(chinese_season.group(1))
+        base = re.sub(r'\s+', '', base)
+        if re.search(r'[\u4e00-\u9fff]', base):
+            return base
+
+    # 中文标题没有中文季度标记，但后面带英文片名/英文 Season 标记时，
+    # 只保留中文标题，避免把整段英文片名写入 WebDAV 目录。
+    chinese_match = re.search(
+        r'[\u4e00-\u9fff][\u4e00-\u9fff\s·・\-—_]*',
+        text
+    )
+    if chinese_match:
+        chinese_base = re.sub(r'\s+', '', chinese_match.group(0)).strip(' -–—_|｜')
+        if chinese_base:
+            # 没有显式季度标记的中文单季资源保持原剧名，不人为追加“第1季”。
+            if season == 1:
+                return chinese_base
+            return f"{chinese_base} 第{season}季"
+
+    # 没有中文名时保留英文片名，但去掉已有 Season/SN 季数标记。
+    base = remove_season_markers(text)
+    if not base:
+        base = text.strip()
+    return f"{base} 第{season}季"
+
 def get_show_name(page):
-    """
-    从一级 SeedHub 页面获取剧名。
-
-    当前页面实际结构中，h1 可能得到：
-
-        #
-        云 雀 叫 天 录
-
-    所以：
-        1. 清理中文字符之间的空格
-        2. 忽略单独的 #
-        3. 取第一个有效标题
-    """
-
-    # --------------------------------------------------------
-    # 优先尝试 h1
-    # --------------------------------------------------------
+    h1_candidates = []
 
     try:
         h1s = page.locator("h1").all_inner_texts()
 
         for raw in h1s:
-
             text = normalize_text(raw)
 
             if not text:
@@ -127,17 +316,14 @@ def get_show_name(page):
             lines = []
 
             for line in text.splitlines():
-
                 line = line.strip()
 
                 if not line:
                     continue
 
-                # 页面中的独立 # 是装饰，不是剧名
                 if line == "#":
                     continue
 
-                # 去掉开头的 #
                 line = re.sub(
                     r'^#\s*',
                     '',
@@ -148,41 +334,39 @@ def get_show_name(page):
                     lines.append(line)
 
             if lines:
-                return lines[0]
+                h1_candidates.append(lines[0])
 
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # 如果 h1 没有得到结果，再尝试 title
-    # --------------------------------------------------------
+    source_name = ""
 
-    try:
-        title = normalize_text(page.title())
+    if h1_candidates:
+        source_name = h1_candidates[0]
 
-        if title:
+    if not source_name:
+        try:
+            source_name = normalize_text(page.title())
 
-            # 去掉常见站点后缀
-            title = re.sub(
+            source_name = re.sub(
                 r'\s*[-|｜]\s*SeedHub.*$',
                 '',
-                title,
+                source_name,
                 flags=re.I
             )
 
-            title = re.sub(
+            source_name = re.sub(
                 r'^#\s*',
                 '',
-                title
+                source_name
             ).strip()
+        except Exception:
+            source_name = ""
 
-            if title:
-                return title
+    if not source_name:
+        return ""
 
-    except Exception:
-        pass
-
-    return ""
+    return source_name
 
 
 # ============================================================
@@ -190,54 +374,19 @@ def get_show_name(page):
 # ============================================================
 
 def detect_total_episodes(page):
-    """
-    从 SeedHub 一级页面的影片信息中读取真实集数。
-
-    当前实际页面文本：
-
-        集 数 : 40
-
-    因此只针对“集数”字段进行解析。
-
-    注意：
-        这里的 total_episodes 是 SeedHub 一级页面
-        提供的剧集信息。
-
-        绝不能使用：
-            Quark 分享最高集数
-            资源标题中的“更新至XX集”
-            share_files 最高 episode
-
-        来代替这个值。
-    """
-
     try:
-
         body_text = page.locator("body").inner_text()
-
-        # 先清理中文字符之间的空格
         body_text = normalize_text(body_text)
 
         patterns = [
-
-            # 集 数 : 40
             r'集\s*数\s*[:：]\s*(\d+)',
-
-            # 集数：40
             r'集数\s*[:：]\s*(\d+)',
-
         ]
 
         for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                body_text,
-                re.I
-            )
+            match = re.search(pattern, body_text, re.I)
 
             if match:
-
                 value = int(match.group(1))
 
                 if value > 0:
@@ -254,27 +403,6 @@ def detect_total_episodes(page):
 # ============================================================
 
 def get_quark_entries(page, start_rank, max_count):
-    """
-    获取指定 rank 范围内的 Quark 入口。
-
-    start_rank:
-        从哪个 SeedHub rank 开始。
-
-    max_count:
-        本次最多获取多少个。
-
-    例如：
-
-        share_scan_rank = 12
-        页面当前有 13 个
-
-    那么：
-
-        start_rank = 13
-
-    只获取第13个。
-    """
-
     links = page.locator(
         '.pan-links a[data-link*="quark"]'
     )
@@ -284,7 +412,6 @@ def get_quark_entries(page, start_rank, max_count):
     print("找到夸克入口:", total)
 
     if start_rank > total:
-
         return [], total
 
     end_rank = min(
@@ -295,8 +422,6 @@ def get_quark_entries(page, start_rank, max_count):
     items = []
 
     for rank in range(start_rank, end_rank + 1):
-
-        # Playwright nth() 从 0 开始
         a = links.nth(rank - 1)
 
         href = a.get_attribute("href")
@@ -322,18 +447,11 @@ def get_quark_entries(page, start_rank, max_count):
 # ============================================================
 
 def extract_quark_url(html):
-    """
-    从 SeedHub 二级页面 HTML 中提取最终：
-
-        https://pan.quark.cn/s/xxxxx
-    """
-
     found = re.findall(
         r'https?://pan\.quark\.cn/[^\s"\'<>]+',
         html
     )
 
-    # 去重，同时保持原顺序
     found = list(dict.fromkeys(found))
 
     if not found:
@@ -346,6 +464,20 @@ def extract_quark_url(html):
 # 数据库：获取 / 创建 show
 # ============================================================
 
+def replace_webdav_leaf(path, name):
+    path = (path or "").rstrip("/")
+
+    if not path:
+        return "/kuake/其他/" + name
+
+    parent = path.rsplit("/", 1)[0]
+
+    if not parent:
+        return "/" + name
+
+    return parent + "/" + name
+
+
 def get_or_create_show(
     conn,
     show_name,
@@ -353,7 +485,6 @@ def get_or_create_show(
     webdav_path,
     total_episodes
 ):
-
     conn.execute(
         """
         INSERT INTO shows
@@ -419,7 +550,6 @@ def save_share(
     quark_url,
     rank
 ):
-
     conn.execute(
         """
         INSERT INTO shares
@@ -456,31 +586,9 @@ def calculate_new_scan_rank(
     attempted_items,
     successful_ranks
 ):
-    """
-    只有连续成功的 rank 才推进 share_scan_rank。
-
-    例如：
-
-        old_rank = 12
-
-        rank 13 成功
-        rank 14 成功
-        rank 15 失败
-        rank 16 成功
-
-    那么最终：
-
-        share_scan_rank = 14
-
-    而不是 16。
-
-    这样 rank 15 下次还能继续尝试。
-    """
-
     new_rank = old_rank
 
     for item in attempted_items:
-
         rank = item["rank"]
 
         if rank != new_rank + 1:
@@ -499,41 +607,27 @@ def calculate_new_scan_rank(
 # ============================================================
 
 def main():
-
     if len(sys.argv) != 2:
-
         print(
             "用法: python3 seedhub_cache.py <SeedHub一级页面URL>",
             file=sys.stderr
         )
-
         sys.exit(2)
 
     movie_url = sys.argv[1]
-
-    # --------------------------------------------------------
-    # URL 基本检查
-    # --------------------------------------------------------
 
     if not re.match(
         r'^https?://(?:www\.)?seedhub\.cc/movies/',
         movie_url,
         re.I
     ):
-
         print(
             "错误：不是有效的 SeedHub 电影/剧集页面 URL",
             file=sys.stderr
         )
-
         sys.exit(2)
 
-    # --------------------------------------------------------
-    # Playwright
-    # --------------------------------------------------------
-
     with sync_playwright() as p:
-
         browser = p.chromium.launch(
             headless=False
         )
@@ -548,79 +642,84 @@ def main():
         print("打开电影页面...")
         print(movie_url)
 
-        # ----------------------------------------------------
-        # 打开一级页面
-        # ----------------------------------------------------
-
         try:
-
             page.goto(
                 movie_url,
                 wait_until="domcontentloaded",
                 timeout=PAGE_TIMEOUT
             )
-
         except Exception as e:
-
             print(
                 "一级页面打开失败:",
                 e,
                 file=sys.stderr
             )
-
             browser.close()
-
             sys.exit(1)
 
         # ----------------------------------------------------
-        # 解析剧名
+        # 解析当前一级页面的主标题 + 季数
+        # 季数必须在后续剧名、目录名、数据库 show 信息生成之前确定。
         # ----------------------------------------------------
 
-        show_name = get_show_name(page)
+        show_name_raw = get_show_name(page)
 
-        if not show_name:
-
+        if not show_name_raw:
             print(
                 "错误：无法从一级页面获取剧集名称",
                 file=sys.stderr
             )
-
             browser.close()
-
             sys.exit(1)
 
+        try:
+            season = detect_season(
+                page,
+                movie_url,
+                show_name_raw
+            )
+        except Exception as e:
+            print(
+                "错误：无法可靠识别当前一级页面季数:",
+                e,
+                file=sys.stderr
+            )
+            browser.close()
+            sys.exit(1)
+
+        show_name = seasonize_show_name(
+            show_name_raw,
+            season
+        )
+
+        print(
+            "一级页面主标题:",
+            show_name_raw
+        )
+        print(
+            "当前季数:",
+            f"第{season}季"
+        )
         print(
             "剧集名称:",
             show_name
         )
 
-        # ----------------------------------------------------
-        # 解析真实总集数
-        # ----------------------------------------------------
-
         total_episodes = detect_total_episodes(page)
 
         if total_episodes > 0:
-
             print(
                 "页面真实总集数:",
                 total_episodes
             )
-
         else:
-
             print(
                 "页面未识别到总集数，暂不修改数据库原有值"
             )
 
-        # ----------------------------------------------------
-        # 打开数据库
-        # ----------------------------------------------------
-
         conn = sqlite3.connect(DB_FILE)
 
         try:
-
             conn.execute(
                 "PRAGMA foreign_keys = ON"
             )
@@ -628,10 +727,6 @@ def main():
             conn.execute(
                 "PRAGMA busy_timeout = 10000"
             )
-
-            # ------------------------------------------------
-            # 查找已有 show
-            # ------------------------------------------------
 
             existing = conn.execute(
                 """
@@ -649,7 +744,6 @@ def main():
             ).fetchone()
 
             if existing:
-
                 show_id = existing[0]
 
                 existing_webdav_path = (
@@ -660,31 +754,23 @@ def main():
                     existing[2] or 0
                 )
 
-                old_rank = (
-                    existing[3] or 0
-                )
-
-                # 已经有 WebDAV 路径就保留
                 if existing_webdav_path:
-
-                    webdav_path = (
-                        existing_webdav_path
+                    webdav_path = replace_webdav_leaf(
+                        existing_webdav_path,
+                        show_name
                     )
-
                 else:
-
                     webdav_path = (
                         "/kuake/其他/"
                         + show_name
                     )
 
-                # 页面没识别到总集数时，
-                # 保留数据库原来的值
                 if total_episodes <= 0:
-
                     total_episodes = (
                         existing_total_episodes
                     )
+
+                old_rank = existing[3] or 0
 
                 print(
                     "已有 show_id:",
@@ -697,22 +783,14 @@ def main():
                 )
 
             else:
-
                 show_id = None
-
                 old_rank = 0
-
                 webdav_path = (
                     "/kuake/其他/"
                     + show_name
                 )
 
-            # ------------------------------------------------
-            # 创建 / 更新 show
-            # ------------------------------------------------
-
             if show_id is None:
-
                 row = get_or_create_show(
                     conn,
                     show_name,
@@ -720,9 +798,7 @@ def main():
                     webdav_path,
                     total_episodes
                 )
-
             else:
-
                 conn.execute(
                     """
                     UPDATE shows
@@ -767,11 +843,8 @@ def main():
                 ).fetchone()
 
             show_id = row[0]
-
             current_total_episodes = row[1] or 0
-
             old_rank = row[2] or 0
-
             webdav_path = row[3] or webdav_path
 
             print(
@@ -788,10 +861,6 @@ def main():
                 "数据库 total_episodes:",
                 current_total_episodes
             )
-
-            # ------------------------------------------------
-            # 获取需要新增扫描的 Quark 入口
-            # ------------------------------------------------
 
             start_rank = old_rank + 1
 
@@ -822,12 +891,7 @@ def main():
                 len(items)
             )
 
-            # ------------------------------------------------
-            # 没有新的 SeedHub 分享
-            # ------------------------------------------------
-
             if not items:
-
                 print()
                 print(
                     "没有新的 SeedHub 分享需要缓存。"
@@ -865,6 +929,7 @@ def main():
                 print("==============================")
                 print("show_id:", show_id)
                 print("名称:", show_name)
+                print("当前季数:", f"第{season}季")
                 print(
                     "一级页面 Quark 入口:",
                     total_links
@@ -885,13 +950,8 @@ def main():
 
                 return
 
-            # ------------------------------------------------
-            # 开始逐个打开二级页面
-            # ------------------------------------------------
-
             success = 0
             failed = 0
-
             successful_ranks = set()
 
             print()
@@ -899,14 +959,10 @@ def main():
                 "开始逐个获取 Quark 链接"
             )
 
-            for index, item in enumerate(
-                items
-            ):
-
+            for index, item in enumerate(items):
                 rank = item["rank"]
 
                 print()
-
                 print(
                     "[%02d] %s"
                     % (
@@ -921,7 +977,6 @@ def main():
                 )
 
                 try:
-
                     page.goto(
                         item["url"],
                         wait_until="domcontentloaded",
@@ -935,13 +990,10 @@ def main():
                     )
 
                     if not quark_url:
-
                         print(
                             "     没找到 Quark"
                         )
-
                         failed += 1
-
                         continue
 
                     print(
@@ -963,34 +1015,22 @@ def main():
                     success += 1
 
                 except Exception as e:
-
                     print(
                         "     ERROR:",
                         e
                     )
-
                     failed += 1
 
-                # 二级页面之间等待
                 if index < len(items) - 1:
-
                     time.sleep(
                         PAGE_DELAY
                     )
-
-            # ------------------------------------------------
-            # 计算新的扫描进度
-            # ------------------------------------------------
 
             new_rank = calculate_new_scan_rank(
                 old_rank,
                 items,
                 successful_ranks
             )
-
-            # ------------------------------------------------
-            # 更新 shows
-            # ------------------------------------------------
 
             conn.execute(
                 """
@@ -1009,10 +1049,6 @@ def main():
 
             conn.commit()
 
-            # ------------------------------------------------
-            # 查询最终分享数量
-            # ------------------------------------------------
-
             count = conn.execute(
                 """
                 SELECT COUNT(*)
@@ -1024,90 +1060,57 @@ def main():
                 )
             ).fetchone()[0]
 
-            # ------------------------------------------------
-            # 输出结果
-            # ------------------------------------------------
-
             print()
             print(
                 "=============================="
             )
-
-            print(
-                "SeedHub 缓存完成"
-            )
-
-            print(
-                "=============================="
-            )
-
-            print(
-                "show_id:",
-                show_id
-            )
-
-            print(
-                "名称:",
-                show_name
-            )
-
+            print("SeedHub 缓存完成")
+            print("==============================")
+            print("show_id:", show_id)
+            print("名称:", show_name)
+            print("当前季数:", f"第{season}季")
             print(
                 "一级页面 Quark 入口:",
                 total_links
             )
-
             print(
                 "本次扫描:",
                 len(items)
             )
-
             print(
                 "成功获取:",
                 success
             )
-
             print(
                 "失败:",
                 failed
             )
-
             print(
                 "数据库分享总数:",
                 count
             )
-
             print(
                 "旧 share_scan_rank:",
                 old_rank
             )
-
             print(
                 "新 share_scan_rank:",
                 new_rank
             )
-
             print(
                 "total_episodes:",
                 current_total_episodes
             )
-
             print(
                 "WebDAV:",
                 webdav_path
             )
+            print("==============================")
 
-            print(
-                "=============================="
-            )
-
-            # 如果本次一个都没成功，
-            # 返回失败给上层调用者
             if success == 0:
-
                 sys.exit(1)
 
         finally:
-
             conn.close()
             browser.close()
 
