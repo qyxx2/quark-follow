@@ -11,10 +11,15 @@ LOG_DIR="$LOG_DIR_DEFAULT"
 LOG_FILE="$LOG_DIR/addfile.log"
 
 TMP_ROOT="/tmp/quark-follow-$$"
+API_STATS_FILE="$LOG_DIR_DEFAULT/api_stats_live_addfile_$$.tsv"
+API_STATS_PY="$BASE_DIR/docker/api_stats.py"
 
 mkdir -p "$TMP_ROOT"
 
 cleanup() {
+    if [ -s "${API_STATS_FILE:-}" ] && [ -f "${API_STATS_PY:-}" ]; then
+        python3 "$API_STATS_PY" --flush "$API_STATS_FILE" >/dev/null 2>&1 || true
+    fi
     rm -rf "$TMP_ROOT"
 }
 
@@ -34,6 +39,7 @@ fi
 
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/addfile.log"
+API_STATS_FILE="$LOG_DIR/api_stats_live_addfile_$$.tsv"
 
 : "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
 : "${OPENLIST_URL:?config.local 中没有 OPENLIST_URL}"
@@ -62,9 +68,11 @@ DRY_RUN="${DRY_RUN:-false}"
 
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
+touch "$API_STATS_FILE" 2>/dev/null || true
 
 chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 600 "$LOG_FILE" 2>/dev/null || true
+chmod 600 "$API_STATS_FILE" 2>/dev/null || true
 chmod 700 "$0" 2>/dev/null || true
 
 
@@ -84,6 +92,29 @@ error() {
 
 warn() {
     log "WARN: $*"
+}
+
+
+# ============================================================
+# API 统计
+# ============================================================
+
+api_stats_record_quark() {
+    local url="$1"
+    local failed="$2"
+    local path operation
+
+    operation="unknown"
+    case "$url" in
+        https://drive-pc.quark.cn/1/clouddrive/*)
+            path="${url#https://drive-pc.quark.cn/1/clouddrive/}"
+            path="${path%%\?*}"
+            [ -n "$path" ] && operation="$path"
+            ;;
+    esac
+
+    printf '%s\tquark\t%s\t%s\n' \
+        "$(date +%s)" "$operation" "$failed" >> "$API_STATS_FILE" 2>/dev/null || true
 }
 
 
@@ -150,16 +181,42 @@ quark_curl() {
 
     quark_rate_limit
 
-    curl -sS \
-        --connect-timeout 20 \
-        --max-time 120 \
-        "${CURL_TLS_ARGS[@]}" \
-        -H "Cookie: $QUARK_COOKIE" \
-        -H 'Origin: https://pan.quark.cn' \
-        -H 'Referer: https://pan.quark.cn/' \
-        -H 'Accept: application/json, text/plain, */*' \
-        -H 'Content-Type: application/json' \
-        "$@"
+    local api_url=""
+    local arg
+    local result
+    local rc
+
+    for arg in "$@"; do
+        case "$arg" in
+            http://*|https://*)
+                api_url="$arg"
+                break
+                ;;
+        esac
+    done
+
+    result="$(
+        curl -sS \
+            --connect-timeout 20 \
+            --max-time 120 \
+            "${CURL_TLS_ARGS[@]}" \
+            -H "Cookie: $QUARK_COOKIE" \
+            -H 'Origin: https://pan.quark.cn' \
+            -H 'Referer: https://pan.quark.cn/' \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'Content-Type: application/json' \
+            "$@"
+    )"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        api_stats_record_quark "$api_url" 0
+    else
+        api_stats_record_quark "$api_url" 1
+    fi
+
+    printf '%s' "$result"
+    return "$rc"
 }
 
 
@@ -255,7 +312,7 @@ get_stoken() {
 
     code="$(printf '%s' "$result" | jq -r '.code // -1')"
     token="$(printf '%s' "$result" | jq -r '.data.stoken // empty')"
-    message="$(printf '%s' "$result" | jq -r '.message // "unknown"')"
+    message="$(printf '%s' "$result" | jq -r '.message // \"unknown\"')"
 
     if [ "$code" != "0" ] || [ -z "$token" ]; then
 

@@ -9,10 +9,15 @@ LOG_DIR_DEFAULT="$BASE_DIR/logs"
 LOG_DIR="$LOG_DIR_DEFAULT"
 LOG_FILE="$LOG_DIR/source_check.log"
 TMP_ROOT="/tmp/quark-follow-source-$$"
+API_STATS_FILE="$LOG_DIR_DEFAULT/api_stats_live_source_check_$$.tsv"
+API_STATS_PY="$BASE_DIR/docker/api_stats.py"
 
 mkdir -p "$TMP_ROOT"
 
 cleanup() {
+    if [ -s "${API_STATS_FILE:-}" ] && [ -f "${API_STATS_PY:-}" ]; then
+        python3 "$API_STATS_PY" --flush "$API_STATS_FILE" >/dev/null 2>&1 || true
+    fi
     rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT INT TERM
@@ -32,6 +37,7 @@ fi
 
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/source_check.log"
+API_STATS_FILE="$LOG_DIR/api_stats_live_source_check_$$.tsv"
 
 : "${QUARK_COOKIE:?config.local 中没有 QUARK_COOKIE}"
 
@@ -54,6 +60,10 @@ chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 600 "$LOG_FILE" 2>/dev/null || true
 chmod 700 "$0" 2>/dev/null || true
 
+# API 统计文件同样只保存时间、服务、接口名和失败标记，不保存 URL 参数、Cookie 或 Token。
+touch "$API_STATS_FILE" 2>/dev/null || true
+chmod 600 "$API_STATS_FILE" 2>/dev/null || true
+
 # ============================================================
 # 日志
 # ============================================================
@@ -70,6 +80,28 @@ error() {
 
 warn() {
     log "WARN: $*"
+}
+
+# ============================================================
+# API 统计
+# ============================================================
+
+api_stats_record_quark() {
+    local url="$1"
+    local failed="$2"
+    local path operation arg
+
+    operation="unknown"
+    case "$url" in
+        https://drive-pc.quark.cn/1/clouddrive/*)
+            path="${url#https://drive-pc.quark.cn/1/clouddrive/}"
+            path="${path%%\?*}"
+            [ -n "$path" ] && operation="$path"
+            ;;
+    esac
+
+    printf '%s\tquark\t%s\t%s\n' \
+        "$(date +%s)" "$operation" "$failed" >> "$API_STATS_FILE" 2>/dev/null || true
 }
 
 # ============================================================
@@ -186,21 +218,47 @@ quark_rate_limit() {
 # ============================================================
 # Quark HTTP
 # 与 addfile.sh 使用相同 Cookie / Header / TLS 方式
+# API 统计只在 curl 完成后追加事件；统计失败绝不影响真实请求。
 # ============================================================
 
 quark_curl() {
     quark_rate_limit
 
-    curl -sS \
-        --connect-timeout 20 \
-        --max-time 120 \
-        "${CURL_TLS_ARGS[@]}" \
-        -H "Cookie: $QUARK_COOKIE" \
-        -H 'Origin: https://pan.quark.cn' \
-        -H 'Referer: https://pan.quark.cn/' \
-        -H 'Accept: application/json, text/plain, */*' \
-        -H 'Content-Type: application/json' \
-        "$@"
+    local api_url=""
+    local arg
+    local result
+    local rc
+
+    for arg in "$@"; do
+        case "$arg" in
+            http://*|https://*)
+                api_url="$arg"
+                break
+                ;;
+        esac
+    done
+
+    result="$(curl -sS \
+            --connect-timeout 20 \
+            --max-time 120 \
+            "${CURL_TLS_ARGS[@]}" \
+            -H "Cookie: $QUARK_COOKIE" \
+            -H 'Origin: https://pan.quark.cn' \
+            -H 'Referer: https://pan.quark.cn/' \
+            -H 'Accept: application/json, text/plain, */*' \
+            -H 'Content-Type: application/json' \
+            "$@"
+    )"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        api_stats_record_quark "$api_url" 0
+    else
+        api_stats_record_quark "$api_url" 1
+    fi
+
+    printf '%s' "$result"
+    return "$rc"
 }
 
 # ============================================================
@@ -395,10 +453,8 @@ parse_episode() {
     if [[ "$stem" =~ [Ss]([0-9]{1,2})[[:space:]_.-]*[Ee][Pp]?([0-9]{1,4}) ]]; then
         season=$((10#${BASH_REMATCH[1]}))
         episode=$((10#${BASH_REMATCH[2]}))
-
     elif [[ "$stem" =~ [Ee][Pp]?([0-9]{1,4}) ]]; then
         episode=$((10#${BASH_REMATCH[1]}))
-
     else
         if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*季 ]]; then
             season="$(cn_number "${BASH_REMATCH[1]}")" || return 1
@@ -406,13 +462,10 @@ parse_episode() {
 
         if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*集 ]]; then
             episode="$(cn_number "${BASH_REMATCH[1]}")" || return 1
-
         elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})[[:space:]_.-]*$ ]]; then
             episode=$((10#${BASH_REMATCH[1]}))
-
         elif [[ "$stem" =~ [Ee]pisode[[:space:]_.-]*([0-9]{1,4}) ]]; then
             episode=$((10#${BASH_REMATCH[1]}))
-
         else
             return 1
         fi

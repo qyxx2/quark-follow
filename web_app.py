@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Small, authenticated management UI layered on top of quark-follow scripts."""
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,7 @@ DB = BASE / "resource.db"
 RESOURCES = BASE / "resources.json"
 CONFIG = BASE / "config.local"
 LOG_DIR = BASE / "logs"
+API_STATS_PY = BASE / "docker" / "api_stats.py"
 LOCKS = {"resource_check": BASE / "resource_check.lock", "replace": BASE / "replace.lock"}
 WEB_RESTART_SCRIPT = BASE / "restart-web.sh"
 WEB_RESTART_LOCK = BASE / "web-restart.lock"
@@ -94,6 +96,51 @@ CONFIG_FIELDS = [
 ]
 ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*?)(\s*)$")
 LOG_RE = re.compile(r"^\[(?P<time>[^\]]+)\]\s*\[(?P<category>[A-Z]+)\]\s*(?P<message>.*)$")
+
+
+_api_stats_snapshot = None
+try:
+    if API_STATS_PY.is_file():
+        _spec = importlib.util.spec_from_file_location("quark_follow_api_stats", API_STATS_PY)
+        if _spec and _spec.loader:
+            _module = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_module)
+            _api_stats_snapshot = _module.snapshot
+except Exception:
+    _api_stats_snapshot = None
+
+
+def api_stats_data():
+    if _api_stats_snapshot is None:
+        return {
+            "available": False,
+            "error": "API 统计组件不可用。",
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "summary": {
+                name: {"calls": 0, "failures": 0, "services": {}}
+                for name in ("1m", "1h", "24h", "today")
+            },
+            "operations": {name: [] for name in ("1m", "1h", "24h", "today")},
+            "timeline": [],
+            "retention_days": 0,
+        }
+    try:
+        data = _api_stats_snapshot()
+        data["available"] = True
+        return data
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": f"API 统计读取失败：{exc}",
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "summary": {
+                name: {"calls": 0, "failures": 0, "services": {}}
+                for name in ("1m", "1h", "24h", "today")
+            },
+            "operations": {name: [] for name in ("1m", "1h", "24h", "today")},
+            "timeline": [],
+            "retention_days": 0,
+        }
 
 
 def login_required(fn):
@@ -392,7 +439,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:13px max(16px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}nav{display:flex;gap:12px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}@media(max-width:560px){header{align-items:flex-start;flex-direction:column}th,td{padding:7px 5px}.container{padding:10px}}</style><body><header><strong>quark-follow</strong><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:13px max(16px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}nav{display:flex;gap:12px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}@media(max-width:560px){header{align-items:flex-start;flex-direction:column}th,td{padding:7px 5px}.container{padding:10px}}</style><body><header><strong>quark-follow</strong><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -580,7 +627,7 @@ def resource_detail(show_id):
 
     missing = [x for x in range(1, total + 1) if x not in owned]
     return render_template_string(
-        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\\n\\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\\nWebDAV 中已经存在的文件不会删除。\\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
+        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\n\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\nWebDAV 中已经存在的文件不会删除。\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
         show=show,
         shares=shares,
         total=total,
@@ -684,7 +731,7 @@ def exclude_share(show_id, share_id):
     except sqlite3.Error as exc:
         write_web_log(
             "EXCLUDE",
-            f"Share 排除失败：show_id={show_id} share_id={share_id} error={exc}",
+            f"排除 Share 失败：show_id={show_id} share_id={share_id} error={exc}",
         )
         flash(f'排除 Share 失败：{exc}')
         return redirect(url_for("resource_detail", show_id=show_id))
@@ -817,7 +864,7 @@ def delete_resource(show_id):
                 pass
         write_web_log(
             "DELETE",
-            f"资源删除失败：show_id={show_id} name={show['name']} error={exc}",
+            f"删除资源失败：show_id={show_id} name={show['name']} error={exc}",
         )
         flash(f"删除资源失败：{exc}")
         return redirect(url_for("resource_detail", show_id=show_id))
@@ -883,6 +930,77 @@ def start_task(script, args):
                 )
             flash(f'已在后台启动 {script}。')
     return redirect(request.referrer or url_for('index'))
+
+@app.route('/api-stats')
+@login_required
+def api_stats_page():
+    return render_template_string(
+        BASE_TEMPLATE + """<h1>API 调用统计</h1>
+        <div id='stats'></div>
+        <p class='muted'>Quark 统计实际 quark_curl 调用；SeedHub 统计 Playwright 页面导航。Web 管理页面自身的 /api/* 请求不计入。统计保留 {{retention_days}} 天；正在运行的任务会先显示实时统计，任务结束后再汇总入库。</p>
+        <script>
+        const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+        const fmt=n=>Number(n||0).toLocaleString();
+        const labels={
+          'share/sharepage/token':'获取分享 stoken',
+          'share/sharepage/detail':'读取分享目录',
+          'file/info/path_list':'读取目标路径 FID',
+          'file/sort':'读取目标目录',
+          'file/rename':'重命名文件',
+          'file/delete':'删除文件',
+          'share/sharepage/save':'提交转存',
+          'task':'查询转存任务',
+          'unknown':'未知接口',
+          'movie_page':'SeedHub 一级页面',
+          'share_page':'SeedHub 二级页面'
+        };
+        function opName(service,operation){return labels[operation]||operation;}
+        function serviceName(s){return s==='quark'?'Quark API':s==='seedhub'?'SeedHub':'';}
+        function card(title,d){
+          let q=d?.services?.quark||{calls:0,failures:0};
+          let h=d?.services?.seedhub||{calls:0,failures:0};
+          return `<div class=card><div class=label>${title}</div><div class=metric>${fmt(d?.calls)}</div><div class=muted>失败 ${fmt(d?.failures)} · Quark ${fmt(q.calls)} / ${fmt(q.failures)} · SeedHub ${fmt(h.calls)} / ${fmt(h.failures)}</div></div>`;
+        }
+        function render(d){
+          let root=document.querySelector('#stats');
+          if(!d.available){root.innerHTML=`<div class=card><h2>统计暂不可用</h2><p class=bad>${esc(d.error||'未知错误')}</p></div>`;return;}
+          let ops=d.operations?.['24h']||[];
+          let rows=ops.map(x=>`<tr><td>${esc(serviceName(x.service))}</td><td><code>${esc(x.operation)}</code><br><span class=muted>${esc(opName(x.service,x.operation))}</span></td><td>${fmt(x.calls)}</td><td>${fmt(x.failures)}</td></tr>`).join('');
+          let timeline=(d.timeline||[]).map(x=>{
+            let q=Number(x.quark||0), h=Number(x.seedhub||0), total=Math.max(q,h,1);
+            return `<tr><td>${esc(x.time)}</td><td>${fmt(q)}</td><td>${fmt(h)}</td><td>${fmt(q+h)}</td><td><div style="min-width:160px"><div style="height:8px;background:#e8eefc;border-radius:5px;overflow:hidden"><div style="height:8px;width:${Math.min(100,(q/total)*100)}%;background:#2364d2"></div></div><div style="height:8px;background:#f2e7d3;border-radius:5px;overflow:hidden;margin-top:3px"><div style="height:8px;width:${Math.min(100,(h/total)*100)}%;background:#aa6900"></div></div></div></td></tr>`;
+          }).join('');
+          root.innerHTML=`
+            <div class=grid>
+              ${card('最近 1 分钟',d.summary?.['1m'])}
+              ${card('最近 1 小时',d.summary?.['1h'])}
+              ${card('最近 24 小时',d.summary?.['24h'])}
+              ${card('今日',d.summary?.today)}
+            </div>
+            <div class=card><div class=label>24 小时调用明细</div><div class=tablewrap><table><tr><th>服务</th><th>接口</th><th>调用次数</th><th>失败次数</th></tr>${rows||'<tr><td colspan=4>最近 24 小时暂无统计。</td></tr>'}</table></div></div>
+            <div class=card><div class=label>最近 24 小时逐小时调用量</div><div class=tablewrap><table><tr><th>时间</th><th>Quark</th><th>SeedHub</th><th>合计</th><th>相对量</th></tr>${timeline||'<tr><td colspan=5>暂无统计。</td></tr>'}</table></div></div>
+            <div class=muted style="margin:6px 0 18px">最后更新：${esc(d.generated_at||'')} · 统计数据库保留 ${fmt(d.retention_days)} 天</div>`;
+        }
+        async function loadStats(){
+          try{
+            const r=await fetch('/api/stats?ts='+Date.now(),{cache:'no-store'});
+            if(!r.ok) throw new Error('HTTP '+r.status);
+            render(await r.json());
+          }catch(e){
+            document.querySelector('#stats').innerHTML=`<div class=card><h2>统计读取失败</h2><p class=bad>${esc(e.message||e)}</p></div>`;
+          }
+        }
+        loadStats();setInterval(loadStats,5000);
+        </script></main>""",
+        retention_days=api_stats_data().get('retention_days',0),
+    )
+
+
+@app.route('/api/stats')
+@login_required
+def api_stats():
+    return jsonify(api_stats_data())
+
 
 @app.route('/logs')
 @login_required
