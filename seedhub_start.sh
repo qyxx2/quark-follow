@@ -44,6 +44,8 @@ log "INFO: 容器不存在，正在创建..."
 
 docker run -d \
     --name "$CONTAINER" \
+    -e TZ=Asia/Shanghai \
+    -v /etc/localtime:/etc/localtime:ro \
     -v "$WORK_DIR:/work" \
     -v "$BASE_DIR:/data" \
     "$IMAGE" \
