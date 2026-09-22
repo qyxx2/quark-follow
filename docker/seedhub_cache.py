@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import re
 import sys
 import time
@@ -10,6 +11,17 @@ import builtins
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
+os.environ.setdefault("QUARK_FOLLOW_BASE", "/data")
+try:
+    from api_stats import record_event as _api_stats_record_event
+    from api_stats import flush_event_file as _api_stats_flush_event_file
+except Exception:
+    def _api_stats_record_event(*_args, **_kwargs):
+        return None
+
+    def _api_stats_flush_event_file(*_args, **_kwargs):
+        return False
+
 
 # ============================================================
 # 基本配置
@@ -18,6 +30,7 @@ from playwright.sync_api import sync_playwright
 BASE_URL = "https://www.seedhub.cc"
 DB_FILE = "/data/resource.db"
 LOG_FILE = Path("/data/logs/seedhub_cache.log")
+API_STATS_FILE = LOG_FILE.parent / f"api_stats_live_seedhub_{os.getpid()}.tsv"
 
 SCAN_BATCH_SIZE = 20
 PAGE_TIMEOUT = 60000
@@ -50,6 +63,28 @@ ROMAN_SEASONS = {
     "Ⅸ": 9,
     "Ⅹ": 10,
 }
+
+
+def api_stats_record(operation, failed=False):
+    try:
+        _api_stats_record_event(API_STATS_FILE, "seedhub", operation, failed=failed)
+    except Exception:
+        pass
+
+
+def api_stats_flush():
+    try:
+        _api_stats_flush_event_file(API_STATS_FILE)
+    except Exception:
+        pass
+
+
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+try:
+    API_STATS_FILE.touch(exist_ok=True)
+    os.chmod(API_STATS_FILE, 0o600)
+except OSError:
+    pass
 
 
 def log_print(*args, **kwargs):
@@ -202,6 +237,7 @@ def detect_season(page, movie_url, primary_title):
 
     return unique[0]
 
+
 def remove_season_markers(text):
     text = text or ""
 
@@ -300,6 +336,7 @@ def seasonize_show_name(show_name, season):
     if not base:
         base = text.strip()
     return f"{base} 第{season}季"
+
 
 def get_show_name(page):
     h1_candidates = []
@@ -649,13 +686,17 @@ def main():
                 timeout=PAGE_TIMEOUT
             )
         except Exception as e:
+            api_stats_record("movie_page", failed=True)
             print(
                 "一级页面打开失败:",
                 e,
                 file=sys.stderr
             )
             browser.close()
+            api_stats_flush()
             sys.exit(1)
+        else:
+            api_stats_record("movie_page", failed=False)
 
         # ----------------------------------------------------
         # 解析当前一级页面的主标题 + 季数
@@ -670,6 +711,7 @@ def main():
                 file=sys.stderr
             )
             browser.close()
+            api_stats_flush()
             sys.exit(1)
 
         try:
@@ -685,6 +727,7 @@ def main():
                 file=sys.stderr
             )
             browser.close()
+            api_stats_flush()
             sys.exit(1)
 
         show_name = seasonize_show_name(
@@ -982,7 +1025,18 @@ def main():
                         wait_until="domcontentloaded",
                         timeout=PAGE_TIMEOUT
                     )
+                except Exception as e:
+                    api_stats_record("share_page", failed=True)
+                    print(
+                        "     ERROR:",
+                        e
+                    )
+                    failed += 1
+                    continue
+                else:
+                    api_stats_record("share_page", failed=False)
 
+                try:
                     html = page.content()
 
                     quark_url = extract_quark_url(
@@ -1113,6 +1167,7 @@ def main():
         finally:
             conn.close()
             browser.close()
+            api_stats_flush()
 
 
 if __name__ == "__main__":
