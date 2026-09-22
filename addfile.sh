@@ -177,48 +177,26 @@ quark_rate_limit() {
 # Quark HTTP
 # ============================================================
 
+# ============================================================
+# 持久化 stoken 缓存
+#
+# stoken_cache.sh 负责跨进程/跨运行缓存，并在明确判断 stoken 失效时
+# 自动刷新当前请求一次。普通网络失败不会使缓存失效。
+# ============================================================
+STOKEN_CACHE_FILE="${STOKEN_CACHE_FILE:-$BASE_DIR/stoken_cache.tsv}"
+STOKEN_CACHE_HELPER="$BASE_DIR/stoken_cache.sh"
+
+if [ ! -f "$STOKEN_CACHE_HELPER" ]; then
+    error "缺少 stoken_cache.sh：$STOKEN_CACHE_HELPER"
+    exit 2
+fi
+
+# shellcheck disable=SC1090
+. "$STOKEN_CACHE_HELPER"
+
 quark_curl() {
-
-    quark_rate_limit
-
-    local api_url=""
-    local arg
-    local result
-    local rc
-
-    for arg in "$@"; do
-        case "$arg" in
-            http://*|https://*)
-                api_url="$arg"
-                break
-                ;;
-        esac
-    done
-
-    result="$(
-        curl -sS \
-            --connect-timeout 20 \
-            --max-time 120 \
-            "${CURL_TLS_ARGS[@]}" \
-            -H "Cookie: $QUARK_COOKIE" \
-            -H 'Origin: https://pan.quark.cn' \
-            -H 'Referer: https://pan.quark.cn/' \
-            -H 'Accept: application/json, text/plain, */*' \
-            -H 'Content-Type: application/json' \
-            "$@"
-    )"
-    rc=$?
-
-    if [ "$rc" -eq 0 ]; then
-        api_stats_record_quark "$api_url" 0
-    else
-        api_stats_record_quark "$api_url" 1
-    fi
-
-    printf '%s' "$result"
-    return "$rc"
+    quark_curl_with_stoken_refresh "$@"
 }
-
 
 # ============================================================
 # OpenList HTTP
@@ -244,94 +222,6 @@ get_pwd_id() {
 
     printf '%s\n' "$1" |
         sed -n 's#.*pan\.quark\.cn/s/\([^/#?]*\).*#\1#p'
-}
-
-
-# ============================================================
-# stoken 临时缓存
-#
-# 不写日志。
-# 同一个分享在本次运行中只获取一次。
-# ============================================================
-
-STOKEN_CACHE="$TMP_ROOT/stoken.cache"
-
-get_stoken() {
-
-    local share="$1"
-    local pwd_id="$2"
-
-    local token
-    local result
-    local code
-    local message
-    local lock
-
-    token="$(
-        awk -F '\t' -v id="$pwd_id" '
-            $1 == id {
-                print $3
-                exit
-            }
-        ' "$STOKEN_CACHE" 2>/dev/null
-    )"
-
-    if [ -n "$token" ]; then
-        printf '%s' "$token"
-        return 0
-    fi
-
-    lock="$TMP_ROOT/stoken-$pwd_id.lock"
-
-    while ! mkdir "$lock" 2>/dev/null; do
-        sleep 0.2
-    done
-
-    # 防止并行任务刚好同时请求
-    token="$(
-        awk -F '\t' -v id="$pwd_id" '
-            $1 == id {
-                print $3
-                exit
-            }
-        ' "$STOKEN_CACHE" 2>/dev/null
-    )"
-
-    if [ -n "$token" ]; then
-        rmdir "$lock" 2>/dev/null || true
-        printf '%s' "$token"
-        return 0
-    fi
-
-    result="$(
-        quark_curl \
-            -X POST \
-            'https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc&uc_param_str=' \
-            --data "{\"pwd_id\":\"$pwd_id\",\"passcode\":\"\"}"
-    )"
-
-    code="$(printf '%s' "$result" | jq -r '.code // -1')"
-    token="$(printf '%s' "$result" | jq -r '.data.stoken // empty')"
-    message="$(printf '%s' "$result" | jq -r '.message // \"unknown\"')"
-
-    if [ "$code" != "0" ] || [ -z "$token" ]; then
-
-        error "分享失效或 stoken 获取失败：$share：$message"
-
-        rmdir "$lock" 2>/dev/null || true
-
-        return 1
-    fi
-
-    # stoken 只存临时文件，不进日志
-    printf '%s\t%s\t%s\n' \
-        "$pwd_id" \
-        "$(date +%s)" \
-        "$token" >> "$STOKEN_CACHE"
-
-    rmdir "$lock" 2>/dev/null || true
-
-    printf '%s' "$token"
 }
 
 
@@ -547,9 +437,6 @@ is_archive() {
 }
 
 
-# ============================================================
-# 递归扫描 Quark 分享
-#
 # 输出：
 # key size fid share_fid_token filename extension relative_path
 # ============================================================
@@ -1312,7 +1199,6 @@ process_task() {
     # 每个分享一次批量提交
     # --------------------------------------------------------
 
-    local share
     local group
     local group_id
     local first

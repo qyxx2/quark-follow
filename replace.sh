@@ -174,100 +174,29 @@ api_stats_record_quark() {
         "$(date +%s)" "$operation" "$failed" >> "$API_STATS_FILE" 2>/dev/null || true
 }
 
+# ============================================================
+# 持久化 stoken 缓存
+#
+# stoken_cache.sh 负责跨进程/跨运行缓存，并在明确判断 stoken 失效时
+# 自动刷新当前请求一次。普通网络失败不会使缓存失效。
+# ============================================================
+STOKEN_CACHE_FILE="${STOKEN_CACHE_FILE:-$BASE_DIR/stoken_cache.tsv}"
+STOKEN_CACHE_HELPER="$BASE_DIR/stoken_cache.sh"
+
+if [ ! -f "$STOKEN_CACHE_HELPER" ]; then
+    error "缺少 stoken_cache.sh：$STOKEN_CACHE_HELPER"
+    exit 2
+fi
+
+# shellcheck disable=SC1090
+. "$STOKEN_CACHE_HELPER"
+
 quark_curl() {
-    quark_rate_limit
-
-    local api_url=""
-    local arg result rc
-
-    for arg in "$@"; do
-        case "$arg" in
-            http://*|https://*)
-                api_url="$arg"
-                break
-                ;;
-        esac
-    done
-
-    result="$(
-        curl -sS \
-            --connect-timeout 20 \
-            --max-time 120 \
-            "${CURL_TLS_ARGS[@]}" \
-            -H "Cookie: $QUARK_COOKIE" \
-            -H 'Origin: https://pan.quark.cn' \
-            -H 'Referer: https://pan.quark.cn/' \
-            -H 'Accept: application/json, text/plain, */*' \
-            -H 'Content-Type: application/json' \
-            "$@"
-    )"
-    rc=$?
-
-    if [ "$rc" -eq 0 ]; then
-        api_stats_record_quark "$api_url" 0
-    else
-        api_stats_record_quark "$api_url" 1
-    fi
-
-    printf '%s' "$result"
-    return "$rc"
+    quark_curl_with_stoken_refresh "$@"
 }
-
-openlist_curl() {
-    curl -sS \
-        --connect-timeout 20 \
-        --max-time 60 \
-        "${CURL_TLS_ARGS[@]}" \
-        -H "Authorization: $OPENLIST_TOKEN" \
-        -H 'Content-Type: application/json' \
-        "$@"
-}
-
 get_pwd_id() {
     printf '%s\n' "$1" |
         sed -n 's#.*pan\.quark\.cn/s/\([^/#?]*\).*#\1#p'
-}
-
-STOKEN_CACHE="$TMP_ROOT/stoken.cache"
-
-get_stoken() {
-    local share="$1" pwd_id="$2" token result code message lock
-
-    token="$(awk -F '\t' -v id="$pwd_id" '$1==id{print $2;exit}' "$STOKEN_CACHE" 2>/dev/null || true)"
-    if [ -n "$token" ]; then
-        printf '%s' "$token"
-        return 0
-    fi
-
-    lock="$TMP_ROOT/stoken-$pwd_id.lock"
-    while ! mkdir "$lock" 2>/dev/null; do sleep 0.2; done
-
-    token="$(awk -F '\t' -v id="$pwd_id" '$1==id{print $2;exit}' "$STOKEN_CACHE" 2>/dev/null || true)"
-    if [ -n "$token" ]; then
-        rmdir "$lock" 2>/dev/null || true
-        printf '%s' "$token"
-        return 0
-    fi
-
-    result="$(
-        quark_curl -X POST \
-            'https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc&uc_param_str=' \
-            --data "$(jq -nc --arg p "$pwd_id" '{pwd_id:$p,passcode:""}')"
-    )" || result=''
-
-    code="$(printf '%s' "$result" | jq -r '.code // -1' 2>/dev/null || echo -1)"
-    token="$(printf '%s' "$result" | jq -r '.data.stoken // empty' 2>/dev/null || true)"
-    message="$(printf '%s' "$result" | jq -r '.message // "unknown"' 2>/dev/null || echo unknown)"
-
-    if [ "$code" != "0" ] || [ -z "$token" ]; then
-        rmdir "$lock" 2>/dev/null || true
-        error "获取 stoken 失败：$share：$message"
-        return 1
-    fi
-
-    printf '%s\t%s\n' "$pwd_id" "$token" >> "$STOKEN_CACHE"
-    rmdir "$lock" 2>/dev/null || true
-    printf '%s' "$token"
 }
 
 # 输出：
@@ -592,8 +521,6 @@ process_queue_item() {
         return 1
     }
 
-    # 队列内容来自 resource_check.sh；在进行任何远端操作前仍要确认关键
-    # 数值和集数格式，避免手工改库或损坏记录导致错误替换。
     [[ "$episode" =~ ^S[0-9]{2}E[0-9]{2,4}$ ]] || {
         error "queue=$qid 集数格式无效：$episode"
         return 1
@@ -641,10 +568,8 @@ process_queue_item() {
         return 1
     }
 
-    # 优先精确匹配 queue 记录的旧文件名。
     old_fid="$(awk -F '\t' -v n="$old_filename" '$1==n{print $2;exit}' "$target_list")"
 
-    # 如果文件被外部程序改过名，再用集数+原记录大小做保守回退。
     if [ -z "$old_fid" ]; then
         old_fid="$(awk -F '\t' -v e="$episode" -v s="$old_size" '
             {
@@ -670,21 +595,16 @@ process_queue_item() {
         return 1
     }
 
-    # resource_check.sh 入队时以 old_filename + old_size 标识待替换文件。
-    # 执行前若该快照已变化，不能再沿用旧的收益判断；交给下一轮重新扫描并
-    # 生成新队列，避免覆盖外部刚更新的同名文件。
     [ "$old_size_actual" = "$old_size" ] || {
         error "待替换旧文件已变化，拒绝使用过期队列：$old_filename queued=$old_size actual=$old_size_actual"
         return 1
     }
 
-    # replace_queue 已经由 resource_check 判定过，这里只做执行层防篡改保护。
     [ "$new_size" -gt "$old_size_actual" ] || {
         error "队列中的新文件不大于旧文件，拒绝执行：old=$old_size_actual new=$new_size"
         return 1
     }
 
-    # 重新扫描源 Share，拿到当前有效 fid / share_fid_token。
     source_tmp="$TMP_ROOT/source-$qid.tsv"
     : > "$source_tmp"
 
@@ -695,9 +615,6 @@ process_queue_item() {
         return 1
     }
 
-    # source_check.sh 写入队列的是文件名而不是递归路径。分享中可能有
-    # 同名文件，因此同时匹配入队时的大小，不能仅取扫描结果中的第一个。
-    # 大小不一致意味着缓存已经过期，保守地让本次任务失败而非替换错文件。
     source_line="$(awk -F '\t' -v n="$source_file" -v s="$new_size" '$1==n && $4==s && ($4+0)>0{print;exit}' "$source_tmp")"
 
     if [ -z "$source_line" ]; then
@@ -715,7 +632,6 @@ process_queue_item() {
 
     [[ "$source_size" =~ ^[0-9]+$ ]] || source_size="$new_size"
 
-    # 防止 queue 记录过期后，源文件已经被替换/变小。
     [ "$source_size" -gt "$old_size_actual" ] || {
         error "实时源文件已不满足替换要求：$source_name size=$source_size old=$old_size_actual"
         return 1
@@ -727,12 +643,6 @@ process_queue_item() {
 
     desired_name="${episode}.${source_ext}"
 
-    # --------------------------------------------------------
-    # 第一步：保护旧文件
-    #
-    # 必须先改名，而不是先删除。
-    # 如果后面的转存失败，可以恢复。
-    # --------------------------------------------------------
     backup_name=".replace-backup-${qid}-$(date +%s)-${old_filename}"
 
     if ! quark_rename "$old_fid" "$backup_name"; then
@@ -743,9 +653,6 @@ process_queue_item() {
     backup_fid="$old_fid"
     info "旧文件已临时保护：$old_filename -> $backup_name"
 
-    # --------------------------------------------------------
-    # 第二步：转存新文件
-    # --------------------------------------------------------
     if ! save_one \
         "$source_pwd_id" "$stoken" "$target_fid" \
         "$source_fid" "$source_token" "$share_url"; then
@@ -761,10 +668,6 @@ process_queue_item() {
         return 1
     fi
 
-    # --------------------------------------------------------
-    # 第三步：确认新文件真正出现在 Quark 目标目录
-    # 在这一步之前绝不删除旧文件。
-    # --------------------------------------------------------
     sleep "$OPENLIST_REFRESH_WAIT"
 
     found=false
@@ -803,19 +706,10 @@ process_queue_item() {
         return 1
     fi
 
-    # --------------------------------------------------------
-    # 第四步：统一命名
-    #
-    # 与 addfile.sh 保持一致：
-    #   S01E01.mkv
-    #   S01E02.mp4
-    # --------------------------------------------------------
     if [ "$saved_name" != "$desired_name" ]; then
         if ! quark_rename "$saved_fid" "$desired_name"; then
             error "新文件重命名失败：$saved_name -> $desired_name"
 
-            # 新文件已经存在但没有完成标准化。
-            # 此时恢复旧文件，不删除新文件，避免数据丢失。
             if quark_rename "$backup_fid" "$old_filename"; then
                 info "旧文件恢复成功：$old_filename"
             else
@@ -828,9 +722,6 @@ process_queue_item() {
         saved_name="$desired_name"
     fi
 
-    # --------------------------------------------------------
-    # 第五步：再次确认标准文件存在且大小正确
-    # --------------------------------------------------------
     target_list="$TMP_ROOT/target-$qid-final.tsv"
 
     quark_target_list "$target_fid" "$target_list" || {
@@ -860,16 +751,11 @@ process_queue_item() {
         return 1
     fi
 
-    # --------------------------------------------------------
-    # 第六步：现在才删除旧文件
-    # --------------------------------------------------------
     if ! quark_delete "$backup_fid"; then
         error "新文件已成功，但删除旧文件备份失败：$backup_name"
-        # 不标记 success；这样下一次运行仍能看到 failed 状态。
         return 1
     fi
 
-    # 最后刷新 OpenList，并确认 WebDAV 目标仍可访问。
     wait_openlist_refresh "$target" || warn "OpenList 刷新失败，继续检查 WebDAV"
 
     if ! webdav_exists "$target"; then

@@ -3,3 +3,8 @@ config.local
 
 # Local configuration backups may contain credentials.
 config.local.bak
+
+# Persistent Quark stoken cache; contains credential-like access tokens.
+stoken_cache.tsv
+stoken_cache.tsv.lock/
+stoken_cache.tsv.tmp.*

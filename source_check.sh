@@ -22,17 +22,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ============================================================
-# 读取配置
-# 与 addfile.sh 保持相同的配置调用方式
-# ============================================================
-
 if [ ! -f "$CONFIG" ]; then
     echo "ERROR: 找不到 config.local: $CONFIG" >&2
     exit 1
 fi
 
-# shellcheck disable=SC1090
 . "$CONFIG"
 
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
@@ -49,24 +43,14 @@ VIDEO_MAX_GB="${VIDEO_MAX_GB:-40}"
 ARCHIVE_LOG_MB="${ARCHIVE_LOG_MB:-500}"
 SHARE_DEAD_FAIL_COUNT="${SHARE_DEAD_FAIL_COUNT:-3}"
 
-# 单次运行默认扫描所有非 dead 分享。
-# 可通过命令行缩小范围，方便首次测试：
-#   ./source_check.sh --share-id 1
-#   ./source_check.sh --show-id 1
-
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
 chmod 600 "$CONFIG" 2>/dev/null || true
 chmod 600 "$LOG_FILE" 2>/dev/null || true
 chmod 700 "$0" 2>/dev/null || true
 
-# API 统计文件同样只保存时间、服务、接口名和失败标记，不保存 URL 参数、Cookie 或 Token。
 touch "$API_STATS_FILE" 2>/dev/null || true
 chmod 600 "$API_STATS_FILE" 2>/dev/null || true
-
-# ============================================================
-# 日志
-# ============================================================
 
 log() {
     printf '[%s] [PARSE] %s\n' \
@@ -81,10 +65,6 @@ error() {
 warn() {
     log "WARN: $*"
 }
-
-# ============================================================
-# API 统计
-# ============================================================
 
 api_stats_record_quark() {
     local url="$1"
@@ -104,10 +84,6 @@ api_stats_record_quark() {
         "$(date +%s)" "$operation" "$failed" >> "$API_STATS_FILE" 2>/dev/null || true
 }
 
-# ============================================================
-# 依赖检查
-# ============================================================
-
 for CMD in bash curl jq sed awk sort md5sum date sleep mktemp sqlite3; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         error "缺少命令：$CMD"
@@ -121,12 +97,6 @@ if [ ! -f "$DB" ]; then
     echo "ERROR: 找不到数据库 $DB" >&2
     exit 1
 fi
-
-# ============================================================
-# SQLite 结构检查
-# 数据库结构以数据库设计文档为唯一准则。
-# 本脚本不创建、不修改表结构。
-# ============================================================
 
 sqlite_check_column() {
     local table="$1"
@@ -172,24 +142,13 @@ for spec in \
     fi
 done
 
-# SQLite 并发等待
 sqlite3 "$DB" 'PRAGMA busy_timeout=10000;' >/dev/null 2>&1 || true
-
-# ============================================================
-# curl TLS
-# 与 addfile.sh 保持一致
-# ============================================================
 
 CURL_TLS_ARGS=()
 
 if [ -n "$CURL_TLS_MAX" ]; then
     CURL_TLS_ARGS+=(--tls-max "$CURL_TLS_MAX")
 fi
-
-# ============================================================
-# Quark 全局限速
-# 本脚本当前不主动并行，但仍保留锁，避免以后扩展时破坏限速。
-# ============================================================
 
 RATE_LOCK="$TMP_ROOT/quark-rate.lock"
 RATE_FILE="$TMP_ROOT/quark-last-request"
@@ -216,134 +175,28 @@ quark_rate_limit() {
 }
 
 # ============================================================
-# Quark HTTP
-# 与 addfile.sh 使用相同 Cookie / Header / TLS 方式
-# API 统计只在 curl 完成后追加事件；统计失败绝不影响真实请求。
+# 持久化 stoken 缓存
+#
+# stoken_cache.sh 负责跨进程/跨运行缓存，并在明确判断 stoken 失效时
+# 自动刷新一次当前请求。普通网络失败不会使缓存失效。
 # ============================================================
+STOKEN_CACHE_FILE="${STOKEN_CACHE_FILE:-$BASE_DIR/stoken_cache.tsv}"
+STOKEN_CACHE_HELPER="$BASE_DIR/stoken_cache.sh"
+
+if [ ! -f "$STOKEN_CACHE_HELPER" ]; then
+    error "缺少 stoken_cache.sh：$STOKEN_CACHE_HELPER"
+    exit 2
+fi
+
+# shellcheck disable=SC1090
+. "$STOKEN_CACHE_HELPER"
 
 quark_curl() {
-    quark_rate_limit
-
-    local api_url=""
-    local arg
-    local result
-    local rc
-
-    for arg in "$@"; do
-        case "$arg" in
-            http://*|https://*)
-                api_url="$arg"
-                break
-                ;;
-        esac
-    done
-
-    result="$(curl -sS \
-            --connect-timeout 20 \
-            --max-time 120 \
-            "${CURL_TLS_ARGS[@]}" \
-            -H "Cookie: $QUARK_COOKIE" \
-            -H 'Origin: https://pan.quark.cn' \
-            -H 'Referer: https://pan.quark.cn/' \
-            -H 'Accept: application/json, text/plain, */*' \
-            -H 'Content-Type: application/json' \
-            "$@"
-    )"
-    rc=$?
-
-    if [ "$rc" -eq 0 ]; then
-        api_stats_record_quark "$api_url" 0
-    else
-        api_stats_record_quark "$api_url" 1
-    fi
-
-    printf '%s' "$result"
-    return "$rc"
+    quark_curl_with_stoken_refresh "$@"
 }
-
-# ============================================================
-# 提取 Quark 分享 ID
-# ============================================================
-
 get_pwd_id() {
     printf '%s\n' "$1" |
         sed -n 's#.*pan\.quark\.cn/s/\([^/#?]*\).*#\1#p'
-}
-
-# ============================================================
-# stoken 临时缓存
-# 同一次运行中，一个分享只请求一次。
-# stoken 不写日志。
-# ============================================================
-
-STOKEN_CACHE="$TMP_ROOT/stoken.cache"
-
-get_stoken() {
-    local share="$1"
-    local pwd_id="$2"
-
-    local token result code message lock
-
-    token="$(
-        awk -F '\t' -v id="$pwd_id" '
-            $1 == id {
-                print $3
-                exit
-            }
-        ' "$STOKEN_CACHE" 2>/dev/null
-    )"
-
-    if [ -n "$token" ]; then
-        printf '%s' "$token"
-        return 0
-    fi
-
-    lock="$TMP_ROOT/stoken-$pwd_id.lock"
-
-    while ! mkdir "$lock" 2>/dev/null; do
-        sleep 0.2
-    done
-
-    token="$(
-        awk -F '\t' -v id="$pwd_id" '
-            $1 == id {
-                print $3
-                exit
-            }
-        ' "$STOKEN_CACHE" 2>/dev/null
-    )"
-
-    if [ -n "$token" ]; then
-        rmdir "$lock" 2>/dev/null || true
-        printf '%s' "$token"
-        return 0
-    fi
-
-    result="$(
-        quark_curl \
-            -X POST \
-            'https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc&uc_param_str=' \
-            --data "{\"pwd_id\":\"$pwd_id\",\"passcode\":\"\"}"
-    )"
-
-    code="$(printf '%s' "$result" | jq -r '.code // -1')"
-    token="$(printf '%s' "$result" | jq -r '.data.stoken // empty')"
-    message="$(printf '%s' "$result" | jq -r '.message // "unknown"')"
-
-    if [ "$code" != "0" ] || [ -z "$token" ]; then
-        error "分享 stoken 获取失败：$share：$message"
-        rmdir "$lock" 2>/dev/null || true
-        return 1
-    fi
-
-    printf '%s\t%s\t%s\n' \
-        "$pwd_id" \
-        "$(date +%s)" \
-        "$token" >> "$STOKEN_CACHE"
-
-    rmdir "$lock" 2>/dev/null || true
-
-    printf '%s' "$token"
 }
 
 # ============================================================
@@ -414,10 +267,6 @@ cn_number() {
     esac
 }
 
-# ============================================================
-# ①②③... 转普通数字
-# ============================================================
-
 normalize_circled() {
     local s="$1"
 
@@ -434,12 +283,6 @@ normalize_circled() {
 
     printf '%s' "$s"
 }
-
-# ============================================================
-# 解析剧集编号
-# 与 addfile.sh 保持一致
-# 输出：S01E01
-# ============================================================
 
 parse_episode() {
     local name="$1"
@@ -477,10 +320,6 @@ parse_episode() {
     printf 'S%02dE%02d' "$season" "$episode"
 }
 
-# ============================================================
-# 文件类型
-# ============================================================
-
 is_video() {
     local ext="${1##*.}"
     ext="${ext,,}"
@@ -508,16 +347,6 @@ is_archive() {
             ;;
     esac
 }
-
-# ============================================================
-# 递归扫描 Quark 分享
-#
-# 输出 TSV：
-# episode  size  fid  share_fid_token  filename  extension  relative_path
-#
-# fid/token/path 当前主要用于运行时验证和日志；
-# 当前数据库设计只保存 episode/filename/size。
-# ============================================================
 
 scan_share_dir() {
     local pwd_id="$1"
@@ -598,6 +427,7 @@ scan_share_dir() {
 
             local key ext
             ext="${name##*.}"
+
             key="$(parse_episode "$name" || true)"
 
             if ! [[ "${size:-0}" =~ ^[0-9]+$ ]]; then
@@ -620,16 +450,7 @@ scan_share_dir() {
 
         done < <(
             printf '%s' "$result" |
-                jq -r '
-                    .data.list[]? |
-                    [
-                        (.file_name // ""),
-                        (.fid // ""),
-                        (.share_fid_token // ""),
-                        (.size // 0),
-                        (.dir // false)
-                    ] | @tsv
-                '
+                jq -r '.data.list[]? | [(.file_name // ""),(.fid // ""),(.share_fid_token // ""),(.size // 0),(.dir // false)] | @tsv'
         )
 
         count="$(printf '%s' "$result" | jq '.data.list | length')"
@@ -644,21 +465,11 @@ scan_share_dir() {
         page=$((page + 1))
     done
 }
-
-# ============================================================
-# SQL 字符串安全转义
-# ============================================================
-
 sql_quote() {
     local value="$1"
     value="${value//\'/\'\'}"
     printf "'%s'" "$value"
 }
-
-# ============================================================
-# 更新 shares 状态
-# 失败不会直接删除 share；达到阈值才标记 dead。
-# ============================================================
 
 mark_share_success() {
     local share_id="$1"
@@ -701,20 +512,6 @@ SQL
     sqlite3 "$DB" < "$sql_file"
 }
 
-# ============================================================
-# 成功后写入 share_files
-#
-# 关键安全原则：
-#   1. 先完整扫描到临时文件
-#   2. 扫描成功后才进入事务
-#   3. 删除该 share 的旧缓存
-#   4. 写入本次完整结果
-#   5. 任意 API 扫描失败则旧缓存完全不动
-#
-# share_files 是缓存事实表，不在这里做“最佳资源”选择。
-# 同一分享里同一集存在多个视频时，全部保留。
-# ============================================================
-
 replace_share_cache() {
     local share_id="$1"
     local scan_file="$2"
@@ -748,10 +545,6 @@ replace_share_cache() {
 
     return 0
 }
-
-# ============================================================
-# 单个 share
-# ============================================================
 
 process_share() {
     local share_id="$1"
@@ -791,16 +584,14 @@ process_share() {
     scan_file="$TMP_ROOT/share_${share_id}.tsv"
     : > "$scan_file"
 
-    if ! scan_share_dir "$pwd_id" "$stoken" "0" "" "$scan_file"; then
+    if ! scan_share_dir "$pwd_id" "$stoken" "0" "" "$scan_file" "$url"; then
         error "分享递归扫描失败，保留旧缓存：share_id=$share_id url=$url"
         mark_share_failure "$share_id" || true
         return 1
     fi
 
-    # 先按数据库唯一键 (episode, filename) 去重，避免递归扫描出现同名文件时触发 UNIQUE constraint。
-    # 对重复键保留更大的 size；数据库当前不保存 relative_path，因此同名文件只能保留一条事实。
     local dedup_file="$TMP_ROOT/share_${share_id}.dedup.tsv"
-    awk -F '\t' 'BEGIN{OFS="\t"} {k=$1 SUBSEP $5; if (!(k in size) || $2 > size[k]) {size[k]=$2; line[k]=$0}} END{for(k in line) print line[k]}' "$scan_file" > "$dedup_file"
+    awk -F '\t' 'BEGIN{OFS="\t"} {k=$1 SUBSEP $5; if (!(k in size) || $2 > size[k]) {size[k]=$2; line[k]=$0}} END {for(k in line) print line[k]}' "$scan_file" > "$dedup_file"
     sort -u "$dedup_file" -o "$dedup_file" 2>/dev/null || true
     mv "$dedup_file" "$scan_file"
 
@@ -828,10 +619,6 @@ process_share() {
     log "SOURCE成功：share_id=$share_id rank=$seedhub_rank old_cache=$before_count new_cache=$after_count episodes=$episode_count"
     return 0
 }
-
-# ============================================================
-# 参数
-# ============================================================
 
 MODE="all"
 TARGET_ID=""
@@ -872,11 +659,6 @@ HELP
     esac
 done
 
-# ============================================================
-# 读取待处理 shares
-# 顺序按 SeedHub 原始 rank，保证首次测试容易观察。
-# ============================================================
-
 SHARE_LIST="$TMP_ROOT/share_list.tsv"
 
 case "$MODE" in
@@ -908,10 +690,6 @@ if [ ! -s "$SHARE_LIST" ]; then
     exit 0
 fi
 
-# ============================================================
-# 主循环
-# ============================================================
-
 TOTAL=0
 SUCCESS=0
 FAIL=0
@@ -931,7 +709,6 @@ log "全部 source_check 结束：total=$TOTAL success=$SUCCESS fail=$FAIL（exc
 
 printf '[PARSE] source_check 完成：total=%s success=%s fail=%s\n' "$TOTAL" "$SUCCESS" "$FAIL"
 
-# 只要存在失败，返回非 0，方便 cron / 外部监控发现问题。
 if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
