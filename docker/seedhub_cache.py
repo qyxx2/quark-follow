@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import re
 import sys
@@ -32,7 +33,7 @@ DB_FILE = "/data/resource.db"
 LOG_FILE = Path("/data/logs/seedhub_cache.log")
 API_STATS_FILE = LOG_FILE.parent / f"api_stats_live_seedhub_{os.getpid()}.tsv"
 
-SCAN_BATCH_SIZE = 20
+FRONT_SHARE_LIMIT = 20
 PAGE_TIMEOUT = 60000
 PAGE_DELAY = 2
 
@@ -515,6 +516,76 @@ def replace_webdav_leaf(path, name):
     return parent + "/" + name
 
 
+def get_pwd_id(quark_url):
+    match = re.search(r"https?://pan\.quark\.cn/s/([^/#?]+)", quark_url or "", re.I)
+    return match.group(1) if match else ""
+
+
+def ensure_column(conn, table, column, definition):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        print(f"数据库迁移：新增 {table}.{column}")
+        return True
+    return False
+
+
+def ensure_schema(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS share_blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            show_id INTEGER NOT NULL,
+            pwd_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            seedhub_entry_url TEXT,
+            reason TEXT NOT NULL DEFAULT 'empty_after_3_scans',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE CASCADE,
+            UNIQUE(show_id, pwd_id)
+        )
+    """)
+
+    ensure_column(conn, "shows", "share_scan_rank", "INTEGER DEFAULT 0")
+    ensure_column(conn, "shows", "discovery_cursor", "INTEGER NOT NULL DEFAULT 20")
+    ensure_column(conn, "shows", "discovery_fail_rank", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "shows", "discovery_fail_count", "INTEGER NOT NULL DEFAULT 0")
+    new_pool_type = ensure_column(conn, "shares", "pool_type", "TEXT NOT NULL DEFAULT 'front20'")
+    ensure_column(conn, "shares", "seedhub_entry_url", "TEXT")
+    ensure_column(conn, "shares", "pending_probe_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "shares", "used_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "shares", "last_used_at", "TEXT")
+
+    if new_pool_type:
+        conn.execute("""
+            UPDATE shares
+               SET pool_type = CASE
+                   WHEN COALESCE(seedhub_rank,999999) BETWEEN 1 AND 20 THEN 'front20'
+                   ELSE 'overflow'
+               END
+        """)
+
+    conn.execute("UPDATE shows SET discovery_cursor=20 WHERE discovery_cursor IS NULL OR discovery_cursor < 20")
+    conn.execute("UPDATE shows SET discovery_fail_rank=0, discovery_fail_count=0 WHERE discovery_fail_rank IS NULL OR discovery_fail_count IS NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_share_blacklist_show_pwd ON share_blacklist(show_id,pwd_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_pool_rank ON shares(show_id,pool_type,seedhub_rank)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_entry ON shares(show_id,seedhub_entry_url)")
+
+    # 旧版本可能把“成功但没有任何 share_files”的 Share 留成 valid。
+    # 它们已经至少经历过一次成功扫描，因此从 pending_probe_count=1 开始。
+    conn.execute("""
+        UPDATE shares
+           SET status='pending',
+               pending_probe_count=CASE WHEN COALESCE(pending_probe_count,0) < 1 THEN 1 ELSE pending_probe_count END,
+               fail_count=0,
+               last_success=NULL,
+               updated_at=CURRENT_TIMESTAMP
+         WHERE status='valid'
+           AND COALESCE(pending_probe_count,0)=0
+           AND last_success IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM share_files sf WHERE sf.share_id=shares.id)
+    """)
+
+
 def get_or_create_show(
     conn,
     show_name,
@@ -585,7 +656,9 @@ def save_share(
     conn,
     show_id,
     quark_url,
-    rank
+    rank,
+    seedhub_entry_url,
+    pool_type
 ):
     conn.execute(
         """
@@ -593,65 +666,256 @@ def save_share(
         (
             show_id,
             url,
+            seedhub_entry_url,
             seedhub_rank,
             status,
+            pool_type,
             fail_count
         )
-        VALUES (?, ?, ?, 'unknown', 0)
+        VALUES (?, ?, ?, ?, 'unknown', ?, 0)
 
         ON CONFLICT(show_id, url)
         DO UPDATE SET
-
-            seedhub_rank = excluded.seedhub_rank,
-
+            seedhub_entry_url = CASE
+                WHEN excluded.pool_type='front20'
+                     AND (shares.seedhub_rank IS NULL OR excluded.seedhub_rank <= shares.seedhub_rank)
+                THEN excluded.seedhub_entry_url
+                WHEN shares.seedhub_entry_url IS NULL
+                THEN excluded.seedhub_entry_url
+                ELSE shares.seedhub_entry_url
+            END,
+            seedhub_rank = CASE
+                WHEN shares.seedhub_rank IS NULL THEN excluded.seedhub_rank
+                WHEN excluded.pool_type='front20' AND excluded.seedhub_rank < shares.seedhub_rank THEN excluded.seedhub_rank
+                ELSE shares.seedhub_rank
+            END,
+            pool_type = CASE
+                WHEN shares.pool_type='front20' OR excluded.pool_type='front20' THEN 'front20'
+                ELSE 'overflow'
+            END,
             updated_at = CURRENT_TIMESTAMP
         """,
         (
             show_id,
             quark_url,
-            rank
+            seedhub_entry_url,
+            rank,
+            pool_type
         )
     )
 
 
 # ============================================================
-# 计算新的 share_scan_rank
+# SeedHub 前20固定资源池 / 受控额外探索
 # ============================================================
 
-def calculate_new_scan_rank(
-    old_rank,
-    attempted_items,
-    successful_ranks
-):
-    new_rank = old_rank
+def is_blacklisted(conn, show_id, quark_url):
+    pwd_id = get_pwd_id(quark_url)
+    if not pwd_id:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM share_blacklist WHERE show_id=? AND pwd_id=? LIMIT 1",
+        (show_id, pwd_id),
+    ).fetchone()
+    return row is not None
 
-    for item in attempted_items:
+
+def open_entry_and_extract(page, item):
+    print()
+    print("[%02d] %s" % (item["rank"], item["title"][:100]))
+    print("     二级:", item["url"])
+    page.goto(
+        item["url"],
+        wait_until="domcontentloaded",
+        timeout=PAGE_TIMEOUT
+    )
+    html = page.content()
+    quark_url = extract_quark_url(html)
+    if quark_url:
+        print("     Quark:", quark_url)
+    else:
+        print("     没找到 Quark")
+    return quark_url
+
+
+def reconcile_front20(conn, page, show_id):
+    items, total_links = get_quark_entries(page, 1, FRONT_SHARE_LIMIT)
+    current_entries = {item["url"] for item in items}
+    existing_by_entry = {}
+    for row in conn.execute(
+        "SELECT id,seedhub_entry_url FROM shares WHERE show_id=? AND seedhub_entry_url IS NOT NULL",
+        (show_id,),
+    ).fetchall():
+        existing_by_entry[row[1]] = row[0]
+
+    fetched = 0
+    added = 0
+    failed = 0
+
+    for item in items:
+        entry_url = item["url"]
+        existing_id = existing_by_entry.get(entry_url)
+        if existing_id is not None:
+            conn.execute(
+                "UPDATE shares SET seedhub_rank=?, pool_type='front20', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (item["rank"], existing_id),
+            )
+            continue
+
+        try:
+            quark_url = open_entry_and_extract(page, item)
+            fetched += 1
+        except Exception as exc:
+            print("     ERROR:", exc)
+            failed += 1
+            continue
+
+        if not quark_url:
+            continue
+
+        if is_blacklisted(conn, show_id, quark_url):
+            print("     黑名单跳过:", quark_url)
+            continue
+
+        before = conn.execute(
+            "SELECT id,seedhub_entry_url,seedhub_rank FROM shares WHERE show_id=? AND url=? LIMIT 1",
+            (show_id, quark_url),
+        ).fetchone()
+        if before is None:
+            save_share(conn, show_id, quark_url, item["rank"], entry_url, "front20")
+            added += 1
+            share_id = conn.execute(
+                "SELECT id FROM shares WHERE show_id=? AND url=? LIMIT 1",
+                (show_id, quark_url),
+            ).fetchone()[0]
+        else:
+            share_id = before[0]
+            # The current first-20 page is authoritative for the active mapping.
+            # If the same Quark URL used to belong to an entry that is no longer in
+            # the current first 20, move that Share to the new entry/rank. If the old
+            # entry is still in the current first 20, keep its earlier rank.
+            if before[1] not in current_entries or item["rank"] < (before[2] or 999999):
+                conn.execute(
+                    "UPDATE shares SET seedhub_entry_url=?,seedhub_rank=?,pool_type='front20',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (entry_url, item["rank"], share_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE shares SET pool_type='front20',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (share_id,),
+                )
+        existing_by_entry[entry_url] = share_id
+
+        if item is not items[-1]:
+            time.sleep(PAGE_DELAY)
+
+    # 只有在一级页面的 Quark 入口集合完整可判定时，才允许把旧 front20 降级。
+    # 如果页面标记的总入口数量大于本次实际解析出的入口数量，说明本次结果可能不完整；
+    # 此时保留旧 front20，避免一次临时解析异常误删/降级正常资源。
+    complete_front20 = total_links > 0 and len(items) == min(total_links, FRONT_SHARE_LIMIT)
+
+    if complete_front20 and current_entries:
+        placeholders = ",".join("?" for _ in current_entries)
+        params = [show_id, *current_entries]
+        conn.execute(
+            f"UPDATE shares SET pool_type='overflow', updated_at=CURRENT_TIMESTAMP "
+            f"WHERE show_id=? AND pool_type='front20' AND "
+            f"(seedhub_entry_url IS NULL OR seedhub_entry_url NOT IN ({placeholders}))",
+            params,
+        )
+    elif complete_front20:
+        conn.execute(
+            "UPDATE shares SET pool_type='overflow', updated_at=CURRENT_TIMESTAMP WHERE show_id=? AND pool_type='front20'",
+            (show_id,),
+        )
+    else:
+        print("一级页面入口解析不完整，保留现有 front20 资源池，不执行旧 Share 降级。")
+
+    conn.execute(
+        "UPDATE shows SET share_scan_rank=?, discovery_cursor=CASE WHEN COALESCE(discovery_cursor,0)<? THEN ? ELSE discovery_cursor END, last_scan=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (min(total_links, FRONT_SHARE_LIMIT), FRONT_SHARE_LIMIT, FRONT_SHARE_LIMIT, show_id),
+    )
+    conn.commit()
+
+    print()
+    print("前20资源池同步完成：")
+    print("  SeedHub Quark 入口:", total_links)
+    print("  当前前20入口:", len(items))
+    print("  新解析二级入口:", fetched)
+    print("  新增/复用 Share:", added, "/", len(items))
+    print("  二级入口失败:", failed)
+    print("  share_scan_rank:", min(total_links, FRONT_SHARE_LIMIT))
+
+
+def scan_seedhub_range(conn, page, show_id, start_rank, count):
+    items, total_links = get_quark_entries(page, start_rank, count)
+    if not items:
+        print(f"请求的 SeedHub rank={start_rank} 不存在，当前总入口={total_links}")
+        return 3
+
+    processed = 0
+    failed = 0
+    current_cursor = conn.execute(
+        "SELECT COALESCE(discovery_cursor,20) FROM shows WHERE id=?", (show_id,)
+    ).fetchone()[0]
+    current_cursor = max(int(current_cursor or 20), FRONT_SHARE_LIMIT)
+
+    for index, item in enumerate(items):
         rank = item["rank"]
-
-        if rank != new_rank + 1:
+        try:
+            quark_url = open_entry_and_extract(page, item)
+        except Exception as exc:
+            print("     ERROR:", exc)
+            failed += 1
             break
 
-        if rank not in successful_ranks:
+        if not quark_url:
+            print("     未找到 Quark URL，本次不推进 discovery_cursor，交由外层失败计数控制重试。")
+            failed += 1
             break
 
-        new_rank = rank
+        processed += 1
+        if not is_blacklisted(conn, show_id, quark_url):
+            save_share(conn, show_id, quark_url, rank, item["url"], "overflow")
+        else:
+            print("     黑名单跳过:", quark_url)
 
-    return new_rank
+        current_cursor = max(current_cursor, rank)
+        conn.execute(
+            "UPDATE shows SET discovery_cursor=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (current_cursor, show_id),
+        )
+        conn.commit()
 
+        if index < len(items)-1:
+            time.sleep(PAGE_DELAY)
+
+    if failed:
+        return 1
+
+    conn.execute(
+        "UPDATE shows SET last_scan=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (show_id,),
+    )
+    conn.commit()
+    print(f"受控探索完成：rank={start_rank}-{start_rank+processed-1} cursor={current_cursor}")
+    return 0
 
 # ============================================================
 # 主程序
 # ============================================================
 
 def main():
-    if len(sys.argv) != 2:
-        print(
-            "用法: python3 seedhub_cache.py <SeedHub一级页面URL>",
-            file=sys.stderr
-        )
-        sys.exit(2)
+    parser = argparse.ArgumentParser(description="SeedHub Share cache")
+    parser.add_argument("movie_url")
+    parser.add_argument("--range", dest="range_args", nargs=2, type=int, metavar=("START_RANK", "COUNT"))
+    args = parser.parse_args()
 
-    movie_url = sys.argv[1]
+    movie_url = args.movie_url
+
+    if args.range_args and (args.range_args[0] < 1 or args.range_args[1] < 1):
+        print("错误：--range 的 start_rank 和 count 必须 >= 1", file=sys.stderr)
+        sys.exit(2)
 
     if not re.match(
         r'^https?://(?:www\.)?seedhub\.cc/movies/',
@@ -767,6 +1031,8 @@ def main():
                 "PRAGMA foreign_keys = ON"
             )
 
+            ensure_schema(conn)
+
             conn.execute(
                 "PRAGMA busy_timeout = 10000"
             )
@@ -777,7 +1043,8 @@ def main():
                     id,
                     webdav_path,
                     total_episodes,
-                    share_scan_rank
+                    share_scan_rank,
+                    discovery_cursor
                 FROM shows
                 WHERE seedhub_url = ?
                 """,
@@ -814,6 +1081,7 @@ def main():
                     )
 
                 old_rank = existing[3] or 0
+                discovery_cursor = existing[4] or FRONT_SHARE_LIMIT
 
                 print(
                     "已有 show_id:",
@@ -824,10 +1092,15 @@ def main():
                     "已有 share_scan_rank:",
                     old_rank
                 )
+                print(
+                    "已有 discovery_cursor:",
+                    discovery_cursor
+                )
 
             else:
                 show_id = None
                 old_rank = 0
+                discovery_cursor = FRONT_SHARE_LIMIT
                 webdav_path = (
                     "/kuake/其他/"
                     + show_name
@@ -905,264 +1178,15 @@ def main():
                 current_total_episodes
             )
 
-            start_rank = old_rank + 1
-
-            items, total_links = get_quark_entries(
-                page,
-                start_rank,
-                SCAN_BATCH_SIZE
-            )
-
-            print(
-                "当前数据库已扫描到:",
-                old_rank
-            )
-
-            print(
-                "本次从 rank",
-                start_rank,
-                "开始"
-            )
-
-            print(
-                "本次最多扫描:",
-                SCAN_BATCH_SIZE
-            )
-
-            print(
-                "本次实际准备扫描:",
-                len(items)
-            )
-
-            if not items:
-                print()
-                print(
-                    "没有新的 SeedHub 分享需要缓存。"
-                )
-
-                conn.execute(
-                    """
-                    UPDATE shows
-                    SET
-                        last_scan = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (
-                        show_id,
-                    )
-                )
-
-                conn.commit()
-
-                count = conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM shares
-                    WHERE show_id = ?
-                    """,
-                    (
-                        show_id,
-                    )
-                ).fetchone()[0]
-
-                print()
-                print("==============================")
-                print("SeedHub 缓存完成")
-                print("==============================")
-                print("show_id:", show_id)
-                print("名称:", show_name)
-                print("当前季数:", f"第{season}季")
-                print(
-                    "一级页面 Quark 入口:",
-                    total_links
-                )
-                print(
-                    "数据库分享总数:",
-                    count
-                )
-                print(
-                    "share_scan_rank:",
-                    old_rank
-                )
-                print(
-                    "WebDAV:",
-                    webdav_path
-                )
-                print("==============================")
-
+            if args.range_args:
+                start_rank, count = args.range_args
+                rc = scan_seedhub_range(conn, page, show_id, start_rank, count)
+                if rc != 0:
+                    sys.exit(rc)
                 return
 
-            success = 0
-            failed = 0
-            successful_ranks = set()
-
-            print()
-            print(
-                "开始逐个获取 Quark 链接"
-            )
-
-            for index, item in enumerate(items):
-                rank = item["rank"]
-
-                print()
-                print(
-                    "[%02d] %s"
-                    % (
-                        rank,
-                        item["title"][:100]
-                    )
-                )
-
-                print(
-                    "     二级:",
-                    item["url"]
-                )
-
-                try:
-                    page.goto(
-                        item["url"],
-                        wait_until="domcontentloaded",
-                        timeout=PAGE_TIMEOUT
-                    )
-                except Exception as e:
-                    api_stats_record("share_page", failed=True)
-                    print(
-                        "     ERROR:",
-                        e
-                    )
-                    failed += 1
-                    continue
-                else:
-                    api_stats_record("share_page", failed=False)
-
-                try:
-                    html = page.content()
-
-                    quark_url = extract_quark_url(
-                        html
-                    )
-
-                    if not quark_url:
-                        print(
-                            "     没找到 Quark"
-                        )
-                        failed += 1
-                        continue
-
-                    print(
-                        "     Quark:",
-                        quark_url
-                    )
-
-                    save_share(
-                        conn,
-                        show_id,
-                        quark_url,
-                        rank
-                    )
-
-                    successful_ranks.add(
-                        rank
-                    )
-
-                    success += 1
-
-                except Exception as e:
-                    print(
-                        "     ERROR:",
-                        e
-                    )
-                    failed += 1
-
-                if index < len(items) - 1:
-                    time.sleep(
-                        PAGE_DELAY
-                    )
-
-            new_rank = calculate_new_scan_rank(
-                old_rank,
-                items,
-                successful_ranks
-            )
-
-            conn.execute(
-                """
-                UPDATE shows
-                SET
-                    share_scan_rank = ?,
-                    last_scan = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    new_rank,
-                    show_id
-                )
-            )
-
-            conn.commit()
-
-            count = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM shares
-                WHERE show_id = ?
-                """,
-                (
-                    show_id,
-                )
-            ).fetchone()[0]
-
-            print()
-            print(
-                "=============================="
-            )
-            print("SeedHub 缓存完成")
-            print("==============================")
-            print("show_id:", show_id)
-            print("名称:", show_name)
-            print("当前季数:", f"第{season}季")
-            print(
-                "一级页面 Quark 入口:",
-                total_links
-            )
-            print(
-                "本次扫描:",
-                len(items)
-            )
-            print(
-                "成功获取:",
-                success
-            )
-            print(
-                "失败:",
-                failed
-            )
-            print(
-                "数据库分享总数:",
-                count
-            )
-            print(
-                "旧 share_scan_rank:",
-                old_rank
-            )
-            print(
-                "新 share_scan_rank:",
-                new_rank
-            )
-            print(
-                "total_episodes:",
-                current_total_episodes
-            )
-            print(
-                "WebDAV:",
-                webdav_path
-            )
-            print("==============================")
-
-            if success == 0:
-                sys.exit(1)
+            reconcile_front20(conn, page, show_id)
+            return
 
         finally:
             conn.close()
