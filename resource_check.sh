@@ -106,8 +106,15 @@ RESOURCE_AUTO_DISCOVER="${RESOURCE_AUTO_DISCOVER:-true}"
 RESOURCE_RECHECK_EXISTING_MAX="${RESOURCE_RECHECK_EXISTING_MAX:-3}"
 RESOURCE_RECHECK_HOURS="${RESOURCE_RECHECK_HOURS:-24}"
 
-# 每轮 SeedHub 增量发现次数。
-RESOURCE_SEEDHUB_ROUNDS="${RESOURCE_SEEDHUB_ROUNDS:-3}"
+# 每个资源固定维护 SeedHub 前20个入口；21+ 仅在真实缺集时受控探索。
+FRONT_SHARE_LIMIT=20
+RESOURCE_EXTRA_DISCOVERY_PER_RUN="${RESOURCE_EXTRA_DISCOVERY_PER_RUN:-3}"
+RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL="${RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL:-5}"
+RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX="${RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX:-2}"
+RESOURCE_PENDING_RECHECK_HOURS="${RESOURCE_PENDING_RECHECK_HOURS:-24}"
+RESOURCE_PENDING_MAX_CHECKS="${RESOURCE_PENDING_MAX_CHECKS:-3}"
+# 兼容旧配置项；不再作为无限增量扫描参数使用。
+RESOURCE_SEEDHUB_ROUNDS="${RESOURCE_SEEDHUB_ROUNDS:-1}"
 
 # tasks 给 addfile.sh 的 Share 数量上限。
 RESOURCE_TASK_MAX="${RESOURCE_TASK_MAX:-3}"
@@ -135,6 +142,24 @@ RESOURCE_ADD_VERIFY_INTERVAL="${RESOURCE_ADD_VERIFY_INTERVAL:-10}"
 # OpenList 新建/变更目录后，WebDAV 驱动可能需要短暂同步时间。
 RESOURCE_WEBDAV_READY_TIMEOUT="${RESOURCE_WEBDAV_READY_TIMEOUT:-60}"
 RESOURCE_WEBDAV_READY_INTERVAL="${RESOURCE_WEBDAV_READY_INTERVAL:-2}"
+
+for spec in \
+    "FRONT_SHARE_LIMIT:$FRONT_SHARE_LIMIT" \
+    "RESOURCE_EXTRA_DISCOVERY_PER_RUN:$RESOURCE_EXTRA_DISCOVERY_PER_RUN" \
+    "RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL:$RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL" \
+    "RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX:$RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX" \
+    "RESOURCE_PENDING_RECHECK_HOURS:$RESOURCE_PENDING_RECHECK_HOURS" \
+    "RESOURCE_PENDING_MAX_CHECKS:$RESOURCE_PENDING_MAX_CHECKS"; do
+    name="${spec%%:*}"
+    value="${spec#*:}"
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        error "配置项必须是非负整数：$name=$value"
+        exit 2
+    fi
+done
+[ "$FRONT_SHARE_LIMIT" -ge 1 ] || { error "FRONT_SHARE_LIMIT 必须 >= 1"; exit 2; }
+[ "$RESOURCE_PENDING_MAX_CHECKS" -ge 1 ] || { error "RESOURCE_PENDING_MAX_CHECKS 必须 >= 1"; exit 2; }
+[ "$RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX" -ge 1 ] || { error "RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX 必须 >= 1"; exit 2; }
 
 # ============================================================
 # 唯一入口：不接受额外参数
@@ -214,7 +239,7 @@ fi
 
 # ============================================================
 # 数据库结构检查
-# 不创建、不修改表结构；数据库设计以既有数据库设计文档为准。
+# 启动时只做向后兼容的数据库迁移与必要索引；不会删除或重建现有表。
 # ============================================================
 
 sqlite_table_exists() {
@@ -227,7 +252,79 @@ sqlite_column_exists() {
         grep -qx '1'
 }
 
-for table in shows shares share_files webdav_files replace_queue; do
+ensure_runtime_schema() {
+    local changed_pool=0 table column definition
+
+    sqlite3 "$DB" <<'SQL' >/dev/null
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS share_blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    show_id INTEGER NOT NULL,
+    pwd_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    seedhub_entry_url TEXT,
+    reason TEXT NOT NULL DEFAULT 'empty_after_3_scans',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE CASCADE,
+    UNIQUE(show_id,pwd_id)
+);
+CREATE INDEX IF NOT EXISTS idx_share_blacklist_show_pwd ON share_blacklist(show_id,pwd_id);
+SQL
+
+    for spec in \
+        'shows:share_scan_rank' 'shows:discovery_cursor' 'shows:discovery_fail_rank' 'shows:discovery_fail_count' \
+        'shares:seedhub_entry_url' 'shares:pool_type' \
+        'shares:pending_probe_count' 'shares:used_count' 'shares:last_used_at'; do
+        table="${spec%%:*}"
+        column="${spec#*:}"
+        if ! sqlite_column_exists "$table" "$column"; then
+            case "$table:$column" in
+                shows:share_scan_rank) definition="INTEGER DEFAULT 0" ;;
+                shows:discovery_cursor) definition="INTEGER NOT NULL DEFAULT 20" ;;
+                shows:discovery_fail_rank) definition="INTEGER NOT NULL DEFAULT 0" ;;
+                shows:discovery_fail_count) definition="INTEGER NOT NULL DEFAULT 0" ;;
+                shares:seedhub_entry_url) definition="TEXT" ;;
+                shares:pool_type) definition="TEXT NOT NULL DEFAULT 'front20'" ;;
+                shares:pending_probe_count) definition="INTEGER NOT NULL DEFAULT 0" ;;
+                shares:used_count) definition="INTEGER NOT NULL DEFAULT 0" ;;
+                shares:last_used_at) definition="TEXT" ;;
+            esac
+            sqlite3 "$DB" "ALTER TABLE $table ADD COLUMN $column $definition;" || { error "数据库迁移失败：$table.$column"; return 1; }
+            [ "$table:$column" = "shares:pool_type" ] && changed_pool=1
+        fi
+    done
+
+    if [ "$changed_pool" -eq 1 ]; then
+        sqlite3 "$DB" "UPDATE shares SET pool_type=CASE WHEN COALESCE(seedhub_rank,999999) BETWEEN 1 AND $FRONT_SHARE_LIMIT THEN 'front20' ELSE 'overflow' END;"
+    fi
+
+    # These indexes depend on the columns above, so create them only after
+    # legacy-column migration has completed.
+    sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_shares_show_pool_rank ON shares(show_id,pool_type,seedhub_rank); CREATE INDEX IF NOT EXISTS idx_shares_show_entry ON shares(show_id,seedhub_entry_url);" || { error "数据库索引创建失败：shares"; return 1; }
+
+    sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+UPDATE shows SET discovery_cursor=$FRONT_SHARE_LIMIT WHERE discovery_cursor IS NULL OR discovery_cursor<$FRONT_SHARE_LIMIT;
+UPDATE shows SET discovery_fail_rank=0, discovery_fail_count=0 WHERE discovery_fail_rank IS NULL OR discovery_fail_count IS NULL;
+UPDATE shares
+   SET status='pending',
+       pending_probe_count=CASE WHEN COALESCE(pending_probe_count,0)<1 THEN 1 ELSE pending_probe_count END,
+       fail_count=0,
+       last_success=NULL,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE status='valid'
+   AND COALESCE(pending_probe_count,0)=0
+   AND last_success IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM share_files sf WHERE sf.share_id=shares.id);
+SQL
+    return 0
+}
+
+if ! ensure_runtime_schema; then
+    exit 2
+fi
+
+for table in shows shares share_files webdav_files replace_queue share_blacklist; do
     if ! sqlite_table_exists "$table"; then
         error "数据库缺少表：$table"
         exit 2
@@ -236,10 +333,10 @@ done
 
 for spec in \
     'shows:id' 'shows:name' 'shows:seedhub_url' 'shows:webdav_path' \
-    'shows:total_episodes' 'shows:latest_episode' 'shows:share_scan_rank' \
+    'shows:total_episodes' 'shows:latest_episode' 'shows:share_scan_rank' 'shows:discovery_cursor' 'shows:discovery_fail_rank' 'shows:discovery_fail_count' \
     'shows:last_scan' 'shows:updated_at' \
     'shares:id' 'shares:show_id' 'shares:url' 'shares:seedhub_rank' 'shares:status' \
-    'shares:fail_count' 'shares:last_check' 'shares:last_success' \
+    'shares:fail_count' 'shares:last_check' 'shares:last_success' 'shares:seedhub_entry_url' 'shares:pool_type' 'shares:pending_probe_count' 'shares:used_count' 'shares:last_used_at' \
     'share_files:id' 'share_files:share_id' 'share_files:episode' 'share_files:filename' \
     'share_files:size' 'share_files:last_check' \
     'webdav_files:id' 'webdav_files:show_id' 'webdav_files:episode' 'webdav_files:filename' \
@@ -708,7 +805,7 @@ update_webdav_cache() {
         printf '      AND sf.episode=webdav_files.episode\n'
         printf '      AND sf.filename=webdav_files.filename\n'
         printf '      AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)\n'
-        printf '      AND COALESCE(ss.status,\x27unknown\x27) NOT IN (\x27dead\x27,\x27excluded\x27)\n'
+        printf '      AND ss.status=\x27valid\x27\n'
         printf '    ORDER BY COALESCE(ss.seedhub_rank,999999), ss.id\n'
         printf '    LIMIT 1\n'
         printf ')\n'
@@ -721,7 +818,7 @@ update_webdav_cache() {
         printf '        AND sf.episode=webdav_files.episode\n'
         printf '        AND sf.filename=webdav_files.filename\n'
         printf '        AND COALESCE(sf.size,0)=COALESCE(webdav_files.size,0)\n'
-        printf '        AND COALESCE(ss.status,\x27unknown\x27) NOT IN (\x27dead\x27,\x27excluded\x27)\n'
+        printf '        AND ss.status=\x27valid\x27\n'
         printf '  );\n'
 
         printf 'UPDATE shows SET latest_episode=%s,last_scan=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=%s;\n' \
@@ -766,7 +863,7 @@ get_max_known_episode() {
     local season_padded
     printf -v season_padded '%02d' "$RESOURCE_SEASON"
 
-    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB 'S${season_padded}E[0-9][0-9]';")"
+    share_max="$(sqlite3 "$DB" "SELECT COALESCE(MAX(CAST(substr(episode,5) AS INTEGER)),0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND s.status='valid' AND sf.episode GLOB 'S${season_padded}E[0-9][0-9]';")"
 
     if [ -n "$webdav_file" ] && [ -s "$webdav_file" ]; then
         webdav_max="$(awk -F '\t' -v prefix="S${season_padded}E" '
@@ -805,7 +902,7 @@ build_candidates() {
     [ -n "$in_sql" ] || return 0
 
     sqlite3 -tabs "$DB" \
-        "SELECT s.id,s.url,COALESCE(s.seedhub_rank,999999),COALESCE(s.fail_count,0),sf.episode,COALESCE(sf.size,0),sf.filename FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode IN ($in_sql) ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT s.id,s.url,COALESCE(s.seedhub_rank,999999),COALESCE(s.fail_count,0),sf.episode,COALESCE(sf.size,0),sf.filename FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND s.status='valid' AND sf.episode IN ($in_sql) ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$output"
 }
 
@@ -845,7 +942,7 @@ WITH candidate_shares AS (
     FROM share_files sf
     JOIN shares s ON s.id=sf.share_id
     WHERE s.show_id=$(sql_quote "$show_id")
-      AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded')
+      AND s.status='valid'
       AND sf.episode IN ($in_sql)
 )
 SELECT id,url,seedhub_rank
@@ -859,7 +956,7 @@ FROM (
     JOIN shares s ON s.id=cs.id
     JOIN share_files sf_all ON sf_all.share_id=s.id
     WHERE s.show_id=$(sql_quote "$show_id")
-      AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded')
+      AND s.status='valid'
     GROUP BY s.id,s.url,s.seedhub_rank
 ) ranked
 ORDER BY episode_count DESC,seedhub_rank ASC,id ASC
@@ -953,25 +1050,31 @@ source_check_share() {
     return 0
 }
 
-scan_unchecked_shares() {
+scan_unchecked_front20_shares() {
     local show_id="$1" show_name="$2" output="$3" sid
-
-    # SeedHub 首次缓存会一次性写入一批 Share，并同时把 share_scan_rank 推进。
-    # 这些 Share 并不属于“增量 rank > old_rank”逻辑，因此首次空库时必须单独
-    # 扫描所有尚未成功检查的 Share，否则 share_files 只有极少数来源，tasks 无法
-    # 按完整集数进行排序。
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND s.pool_type='front20' AND s.status='unknown' ORDER BY COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$output"
 
     while IFS= read -r sid; do
         [ -n "$sid" ] || continue
         if source_check_share "$show_name" "$sid"; then
-            info "[$show_name] 未扫描 Share 已写入 share_files：share_id=$sid"
+            info "[$show_name] 前20未扫描 Share 已检查：share_id=$sid"
         else
-            warn "[$show_name] 跳过失败的未扫描 Share：share_id=$sid"
+            warn "[$show_name] 前20未扫描 Share 检查失败：share_id=$sid"
         fi
     done < "$output"
+}
+
+recheck_pending_shares() {
+    local show_id="$1" output="$2"
+    local threshold_epoch now_epoch
+    now_epoch="$(date +%s)"
+    threshold_epoch=$((now_epoch - RESOURCE_PENDING_RECHECK_HOURS * 3600))
+
+    sqlite3 "$DB" \
+        "SELECT id FROM shares WHERE show_id=$(sql_quote "$show_id") AND status='pending' AND COALESCE(pending_probe_count,0)<$RESOURCE_PENDING_MAX_CHECKS AND COALESCE(strftime('%s',last_check),0)<=$threshold_epoch ORDER BY COALESCE(pending_probe_count,0),COALESCE(strftime('%s',last_check),0),COALESCE(seedhub_rank,999999),id LIMIT $RESOURCE_RECHECK_EXISTING_MAX;" \
+        > "$output"
 }
 
 recheck_existing_shares() {
@@ -981,53 +1084,167 @@ recheck_existing_shares() {
     threshold_epoch=$((now_epoch - RESOURCE_RECHECK_HOURS * 3600))
 
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s LEFT JOIN (SELECT share_id,MAX(strftime('%s',last_check)) AS checked_epoch,COUNT(*) AS file_count FROM share_files GROUP BY share_id) x ON x.share_id=s.id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (COALESCE(x.file_count,0)=0 OR COALESCE(x.checked_epoch,0)<$threshold_epoch) ORDER BY CASE WHEN COALESCE(x.file_count,0)=0 THEN 0 ELSE 1 END,COALESCE(s.seedhub_rank,999999),s.id LIMIT $RESOURCE_RECHECK_EXISTING_MAX;" \
+        "SELECT id FROM shares WHERE show_id=$(sql_quote "$show_id") AND status='valid' AND COALESCE(strftime('%s',last_check),0)<=$threshold_epoch ORDER BY CASE WHEN pool_type='front20' THEN 0 ELSE 1 END,COALESCE(strftime('%s',last_check),0),COALESCE(seedhub_rank,999999),id LIMIT $RESOURCE_RECHECK_EXISTING_MAX;" \
         > "$output"
 }
 
-scan_new_seedhub_shares() {
-    local show_id="$1" url="$2" name="$3"
-    local rounds old_rank new_rank list sid round
+discover_extra_shares() {
+    local show_id="$1" url="$2" name="$3" total="$4" webdav_file="$5" missing_file="$6" candidate_file="$7"
+    local cursor limit_rank attempt=0 next_rank share_id known_max unresolved rc
+    local fail_rank fail_count
 
     [ "$RESOURCE_AUTO_DISCOVER" = true ] || return 0
+    [[ "$RESOURCE_EXTRA_DISCOVERY_PER_RUN" =~ ^[0-9]+$ ]] || return 0
+    [[ "$RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL" =~ ^[0-9]+$ ]] || return 0
 
-    for ((round=1; round<=RESOURCE_SEEDHUB_ROUNDS; round++)); do
-        old_rank="$(sqlite3 "$DB" "SELECT COALESCE(share_scan_rank,0) FROM shows WHERE id=$(sql_quote "$show_id");")"
-        info "[$name] SeedHub 增量扫描开始：rank=$old_rank"
+    cursor="$(sqlite3 "$DB" "SELECT COALESCE(discovery_cursor,$FRONT_SHARE_LIMIT) FROM shows WHERE id=$(sql_quote "$show_id");")"
+    [[ "$cursor" =~ ^[0-9]+$ ]] || cursor="$FRONT_SHARE_LIMIT"
+    [ "$cursor" -lt "$FRONT_SHARE_LIMIT" ] && cursor="$FRONT_SHARE_LIMIT"
+    IFS=$'\t' read -r fail_rank fail_count < <(sqlite3 -tabs "$DB" "SELECT COALESCE(discovery_fail_rank,0),COALESCE(discovery_fail_count,0) FROM shows WHERE id=$(sql_quote "$show_id");")
+    [[ "$fail_rank" =~ ^[0-9]+$ ]] || fail_rank=0
+    [[ "$fail_count" =~ ^[0-9]+$ ]] || fail_count=0
+    limit_rank=$((FRONT_SHARE_LIMIT + RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL))
 
-        if ! bash "$SEEDHUB_CACHE_SH" "$url" >> "$LOG_FILE" 2>&1; then
-            warn "[$name] seedhub_cache.sh 失败"
-            return 1
+    while [ "$attempt" -lt "$RESOURCE_EXTRA_DISCOVERY_PER_RUN" ]; do
+        known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
+        if [ "$known_max" -gt 0 ]; then
+            [ "$known_max" -gt "$total" ] 2>/dev/null && known_max="$total" || true
+            get_missing_file "$known_max" "$missing_file"
+            build_candidates "$show_id" "$missing_file" "$candidate_file"
+            unresolved="$(count_unresolved "$missing_file" "$candidate_file")"
+        else
+            unresolved=1
         fi
 
-        new_rank="$(sqlite3 "$DB" "SELECT COALESCE(share_scan_rank,0) FROM shows WHERE id=$(sql_quote "$show_id");")"
-        info "[$name] SeedHub rank：$old_rank -> $new_rank"
+        [ "$unresolved" -gt 0 ] || { info "[$name] 当前缺集已有候选，停止额外探索"; return 0; }
 
-        if [ "$new_rank" -le "$old_rank" ]; then
-            info "[$name] 没有新的 SeedHub rank，停止增量扫描"
+        next_rank=$((cursor + 1))
+        if [ "$next_rank" -gt "$limit_rank" ]; then
+            warn "[$name] 已达到额外探索安全上限：rank=${FRONT_SHARE_LIMIT}+${RESOURCE_EXTRA_DISCOVERY_MAX_TOTAL}，停止继续探索"
             return 0
         fi
 
-        list="$TMP_ROOT/new-shares-${show_id}-${round}.txt"
-        sqlite3 "$DB" \
-            "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.seedhub_rank,0)>$old_rank AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND (s.last_success IS NULL OR s.last_check IS NULL) ORDER BY s.seedhub_rank,s.id;" \
-            > "$list"
-
-        if [ ! -s "$list" ]; then
-            info "[$name] 新 rank 主要是重复 Share；继续请求下一批"
+        if [ "$fail_rank" -eq "$next_rank" ] && [ "$fail_count" -ge "$RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX" ]; then
+            warn "[$name] rank=$next_rank 已连续失败 ${fail_count} 次，达到单 rank 安全上限 ${RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX}，跳过该 rank，继续受控探索"
+            cursor="$next_rank"
+            fail_rank=0
+            fail_count=0
+            sqlite3 "$DB" "UPDATE shows SET discovery_cursor=$(sql_quote "$cursor"),discovery_fail_rank=0,discovery_fail_count=0,updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$show_id");"
+            attempt=$((attempt+1))
             continue
         fi
 
-        while IFS= read -r sid; do
-            [ -n "$sid" ] || continue
-            if source_check_share "$name" "$sid"; then
-                info "[$name] 新 Share 已写入 share_files：share_id=$sid"
-            else
-                warn "[$name] 跳过失败的新 Share：share_id=$sid"
-            fi
-        done < "$list"
-    done
+        info "[$name] 受控探索 SeedHub rank=$next_rank（本轮 $((attempt+1))/$RESOURCE_EXTRA_DISCOVERY_PER_RUN，累计上限 rank=$limit_rank）"
+        bash "$SEEDHUB_CACHE_SH" "$url" --range "$next_rank" 1 >> "$LOG_FILE" 2>&1
+        rc=$?
+        case "$rc" in
+            0)
+                cursor="$next_rank"
+                fail_rank=0
+                fail_count=0
+                sqlite3 "$DB" "UPDATE shows SET discovery_cursor=$(sql_quote "$cursor"),discovery_fail_rank=0,discovery_fail_count=0,updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$show_id");"
+                ;;
+            3)
+                info "[$name] SeedHub 已无 rank=$next_rank，停止额外探索"
+                return 0
+                ;;
+            *)
+                if [ "$fail_rank" -eq "$next_rank" ]; then
+                    fail_count=$((fail_count+1))
+                else
+                    fail_rank="$next_rank"
+                    fail_count=1
+                fi
+                sqlite3 "$DB" "UPDATE shows SET discovery_fail_rank=$(sql_quote "$fail_rank"),discovery_fail_count=$(sql_quote "$fail_count"),updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$show_id");"
+                warn "[$name] rank=$next_rank 探索失败：连续失败 ${fail_count}/${RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX}；本次不跳过该 rank，等待后续重试"
+                return 1
+                ;;
+        esac
 
+        share_id="$(sqlite3 "$DB" "SELECT id FROM shares WHERE show_id=$(sql_quote "$show_id") AND seedhub_rank=$next_rank AND status='unknown' ORDER BY id DESC LIMIT 1;")"
+        if [ -n "$share_id" ]; then
+            if source_check_share "$name" "$share_id"; then
+                info "[$name] rank=$next_rank 新 Share 已检查：share_id=$share_id"
+            else
+                warn "[$name] rank=$next_rank 新 Share 检查失败：share_id=$share_id"
+            fi
+        else
+            info "[$name] rank=$next_rank 未产生新的可扫描 Share（可能为重复 Share 或黑名单）"
+        fi
+
+        attempt=$((attempt+1))
+    done
+    return 0
+}
+
+prune_overflow_shares() {
+    local show_id="$1" name="$2" output="$TMP_ROOT/prune-${show_id}.txt"
+    : > "$output"
+
+    # 只删除同时满足：没有唯一集、没有前20之外独占集、没有明显优于前20文件。
+    sqlite3 "$DB" <<SQL > "$output"
+$SQL_BUSY_TIMEOUT
+WITH unique_episode_shares AS (
+    SELECT sf.share_id, sf.episode
+      FROM share_files sf JOIN shares s ON s.id=sf.share_id
+     WHERE s.show_id=$(sql_quote "$show_id") AND s.status='valid'
+     GROUP BY sf.episode HAVING COUNT(DISTINCT sf.share_id)=1
+),
+protected AS (
+    SELECT DISTINCT source_share_id AS share_id FROM webdav_files WHERE show_id=$(sql_quote "$show_id") AND source_share_id IS NOT NULL
+    UNION SELECT DISTINCT source_share_id FROM replace_queue WHERE show_id=$(sql_quote "$show_id") AND status IN ('pending','running')
+),
+front_coverage AS (
+    SELECT DISTINCT sf.episode FROM share_files sf JOIN shares fs ON fs.id=sf.share_id
+     WHERE fs.show_id=$(sql_quote "$show_id") AND fs.pool_type='front20' AND fs.status='valid'
+)
+SELECT s.id
+FROM shares s
+WHERE s.show_id=$(sql_quote "$show_id")
+  AND s.pool_type='overflow'
+  AND (
+       (s.status='unknown' AND COALESCE(s.fail_count,0)=0 AND COALESCE(s.used_count,0)=0)
+       OR
+       (s.status='valid'
+        AND COALESCE(s.used_count,0)=0
+        AND NOT EXISTS (SELECT 1 FROM protected p WHERE p.share_id=s.id)
+        AND NOT EXISTS (SELECT 1 FROM unique_episode_shares u WHERE u.share_id=s.id)
+        AND NOT EXISTS (SELECT 1 FROM share_files x WHERE x.share_id=s.id AND x.episode NOT IN (SELECT episode FROM front_coverage))
+        AND NOT EXISTS (
+            SELECT 1 FROM share_files x
+             WHERE x.share_id=s.id
+               AND EXISTS (
+                   SELECT 1 FROM share_files f2 JOIN shares fs2 ON fs2.id=f2.share_id
+                    WHERE fs2.show_id=$(sql_quote "$show_id")
+                      AND fs2.pool_type='front20'
+                      AND fs2.status='valid'
+                      AND f2.episode=x.episode
+                      AND COALESCE(x.size,0) > COALESCE(f2.size,0) + $((REPLACE_MIN_GAIN_MB*1024*1024))
+                      AND (COALESCE(f2.size,0)=0 OR COALESCE(x.size,0) >= CAST(COALESCE(f2.size,0)*$REPLACE_MIN_RATIO AS INTEGER))
+               )
+        )
+       )
+  );
+SQL
+
+    sort -n -u "$output" -o "$output" 2>/dev/null || true
+    local sid count=0
+    while IFS= read -r sid; do
+        [ -n "$sid" ] || continue
+        if sqlite3 "$DB" <<SQL >/dev/null
+$SQL_BUSY_TIMEOUT
+BEGIN IMMEDIATE;
+DELETE FROM share_files WHERE share_id=$(sql_quote "$sid");
+DELETE FROM shares WHERE id=$(sql_quote "$sid") AND show_id=$(sql_quote "$show_id") AND pool_type='overflow';
+COMMIT;
+SQL
+        then
+            count=$((count+1))
+            info "[$name] 清理无必要 Overflow Share：share_id=$sid"
+        fi
+    done < "$output"
+
+    [ "$count" -gt 0 ] && info "[$name] 本轮 Share 池重平衡清理 $count 个无必要 Overflow Share"
     return 0
 }
 
@@ -1045,7 +1262,7 @@ replacement_window_open() {
 refresh_replacement_sources() {
     local show_id="$1" show_name="$2" output="$3"
     sqlite3 "$DB" \
-        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') ORDER BY CASE WHEN s.last_success IS NULL THEN 0 ELSE 1 END,COALESCE(strftime('%s',s.last_check),0),COALESCE(s.seedhub_rank,999999),s.id LIMIT $REPLACE_SOURCE_CHECK_MAX;" \
+        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND s.status='valid' ORDER BY CASE WHEN s.last_success IS NULL THEN 0 ELSE 1 END,COALESCE(strftime('%s',s.last_check),0),COALESCE(s.seedhub_rank,999999),s.id LIMIT $REPLACE_SOURCE_CHECK_MAX;" \
         > "$output"
 
     while IFS= read -r sid; do
@@ -1063,7 +1280,7 @@ queue_replacements() {
     season_pattern="S${season_padded}E*"
 
     sqlite3 -tabs "$DB" \
-        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND COALESCE(s.status,'unknown') NOT IN ('dead','excluded') AND sf.episode GLOB $(sql_quote "$season_pattern") ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
+        "SELECT sf.episode,s.id,sf.filename,COALESCE(s.seedhub_rank,999999),COALESCE(sf.size,0) FROM share_files sf JOIN shares s ON s.id=sf.share_id WHERE s.show_id=$(sql_quote "$show_id") AND s.status='valid' AND sf.episode GLOB $(sql_quote "$season_pattern") ORDER BY sf.episode,COALESCE(sf.size,0) DESC,COALESCE(s.seedhub_rank,999999),s.id;" \
         > "$all_file"
 
     awk -F '\t' '!seen[$1]++ {print}' "$all_file" > "$best_file"
@@ -1230,11 +1447,9 @@ process_resource() {
         return 1
     fi
 
-    # 首次 SeedHub 缓存后，share_scan_rank 可能已经是 20/40 等最新值；
-    # 不能再用“rank > old_rank”寻找这些刚写入的 Share。先把所有未检查的 Share
-    # 扫描一次，建立完整 share_files，后面的 tasks 才能按 Share 集数正确排名。
+    # SeedHub cache 只维护前20入口；这里只扫描其中尚未建立 share_files 的新 Share。
     local initial_unchecked="$TMP_ROOT/initial-unchecked-${show_id}.txt"
-    scan_unchecked_shares "$show_id" "$resource_name" "$initial_unchecked"
+    scan_unchecked_front20_shares "$show_id" "$resource_name" "$initial_unchecked"
 
     webdav_file="$TMP_ROOT/webdav-${show_id}.tsv"
     missing_file="$TMP_ROOT/missing-${show_id}.txt"
@@ -1268,6 +1483,19 @@ process_resource() {
     # 此时本轮只能判断 E01-E14 是否完整，E15-E18 属于“尚未发现资源”，
     # 不能错误地称为 WebDAV 缺失并无限等待。
     # --------------------------------------------------------
+    # Pending 空 Share 只在到期后重扫；一次最多 RESOURCE_RECHECK_EXISTING_MAX 个。
+    recheck_pending_shares "$show_id" "$recheck_file"
+    if [ -s "$recheck_file" ]; then
+        while IFS= read -r sid; do
+            [ -n "$sid" ] || continue
+            if source_check_share "$resource_name" "$sid"; then
+                info "[$resource_name] 到期 Pending Share 已重扫：share_id=$sid"
+            else
+                warn "[$resource_name] 到期 Pending Share 重扫失败：share_id=$sid"
+            fi
+        done < "$recheck_file"
+    fi
+
     known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
 
     # 如果数据库已有 Share 但缓存为空，先有限重新验证；不能因为 total=18
@@ -1289,7 +1517,7 @@ process_resource() {
 
     # 当前仍完全没有可识别剧集时，才进行 SeedHub 增量发现。
     if [ "$known_max" -eq 0 ]; then
-        scan_new_seedhub_shares "$show_id" "$url" "$resource_name" || true
+        discover_extra_shares "$show_id" "$url" "$resource_name" "$total" "$webdav_file" "$missing_file" "$candidate_file" || true
         known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
     fi
 
@@ -1317,17 +1545,6 @@ process_resource() {
         info "[$resource_name] 当前已发现范围内 WebDAV 缺失 $missing_count_val 集：$(tr '\n' ' ' < "$missing_file")"
     else
         info "[$resource_name] 当前已发现范围 E01-E$(printf '%02d' "$known_max") 已完整存在于 WebDAV"
-    fi
-
-    # 如果当前最高资源集数低于 SeedHub total，尝试继续发现后续 Share。
-    # 注意：发现失败/无新增不会把 E(known_max+1)..total 当成 WebDAV missing。
-    if [ "$known_max" -lt "$total" ]; then
-        scan_new_seedhub_shares "$show_id" "$url" "$resource_name" || true
-        known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
-        [ "$known_max" -gt "$total" ] && known_max="$total"
-        get_missing_file "$known_max" "$missing_file"
-        missing_count_val="$(wc -l < "$missing_file" | awk '{print $1}')"
-        info "[$resource_name] 增量发现后当前资源范围：E01-E$(printf '%02d' "$known_max")；WebDAV 缺失=$missing_count_val"
     fi
 
     # --------------------------------------------------------
@@ -1374,15 +1591,16 @@ process_resource() {
     unresolved="$(count_unresolved "$missing_file" "$candidate_file")"
 
     if [ "$unresolved" -gt 0 ]; then
-        scan_new_seedhub_shares "$show_id" "$url" "$resource_name" || true
+        discover_extra_shares "$show_id" "$url" "$resource_name" "$total" "$webdav_file" "$missing_file" "$candidate_file" || true
         known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
         [ "$known_max" -gt "$total" ] && known_max="$total"
         get_missing_file "$known_max" "$missing_file"
     fi
 
     # --------------------------------------------------------
-    # 4. 重新计算候选并生成 tasks
+    # 4. 重平衡 Share 池，再重新计算候选并生成 tasks
     # --------------------------------------------------------
+    prune_overflow_shares "$show_id" "$resource_name" || true
     build_candidates "$show_id" "$missing_file" "$candidate_file"
     select_task_shares "$show_id" "$candidate_file" "$missing_file" "$selected_file"
     unresolved="$(count_unresolved "$missing_file" "$candidate_file")"

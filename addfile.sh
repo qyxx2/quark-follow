@@ -5,6 +5,7 @@ set -u
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 CONFIG="$BASE_DIR/config.local"
+DB="$BASE_DIR/resource.db"
 TASKS="$BASE_DIR/tasks"
 LOG_DIR_DEFAULT="$BASE_DIR/logs"
 LOG_DIR="$LOG_DIR_DEFAULT"
@@ -94,6 +95,26 @@ warn() {
     log "WARN: $*"
 }
 
+sql_quote() {
+    local value="${1:-}"
+    value="${value//\'/\'\'}"
+    printf "'%s'" "$value"
+}
+
+mark_share_used() {
+    local share="$1"
+    [ -f "$DB" ] || return 0
+    sqlite3 "$DB" <<SQL >/dev/null 2>&1 || true
+PRAGMA busy_timeout=10000;
+UPDATE shares
+   SET used_count=COALESCE(used_count,0)+1,
+       last_used_at=CURRENT_TIMESTAMP,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE url=$(sql_quote "$share")
+   AND COALESCE(status,'unknown')!='excluded';
+SQL
+}
+
 
 # ============================================================
 # API 统计
@@ -122,7 +143,7 @@ api_stats_record_quark() {
 # 依赖检查
 # ============================================================
 
-for CMD in bash curl jq sed awk grep sort md5sum date sleep mktemp; do
+for CMD in bash curl jq sed awk grep sort md5sum date sleep mktemp sqlite3; do
     if ! command -v "$CMD" >/dev/null 2>&1; then
         error "变量/环境失效：缺少命令 $CMD"
         exit 1
@@ -1235,6 +1256,8 @@ process_task() {
             "$share"; then
             task_failed=1
             error "TASK内某个 Share 转存失败：$task_name source=$share"
+        else
+            mark_share_used "$share"
         fi
 
     done < <(cut -f3 "$selected" | sort -u)

@@ -42,6 +42,11 @@ VIDEO_MIN_MB="${VIDEO_MIN_MB:-100}"
 VIDEO_MAX_GB="${VIDEO_MAX_GB:-40}"
 ARCHIVE_LOG_MB="${ARCHIVE_LOG_MB:-500}"
 SHARE_DEAD_FAIL_COUNT="${SHARE_DEAD_FAIL_COUNT:-3}"
+PENDING_RECHECK_HOURS="${PENDING_RECHECK_HOURS:-24}"
+PENDING_MAX_CHECKS="${PENDING_MAX_CHECKS:-3}"
+
+[[ "$PENDING_RECHECK_HOURS" =~ ^[0-9]+$ ]] || { echo "ERROR: PENDING_RECHECK_HOURS 必须是非负整数" >&2; exit 2; }
+[[ "$PENDING_MAX_CHECKS" =~ ^[0-9]+$ ]] && [ "$PENDING_MAX_CHECKS" -ge 1 ] || { echo "ERROR: PENDING_MAX_CHECKS 必须 >= 1" >&2; exit 2; }
 
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
@@ -143,6 +148,87 @@ for spec in \
 done
 
 sqlite3 "$DB" 'PRAGMA busy_timeout=10000;' >/dev/null 2>&1 || true
+
+sqlite3 "$DB" <<'SQL' >/dev/null
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS share_blacklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    show_id INTEGER NOT NULL,
+    pwd_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    seedhub_entry_url TEXT,
+    reason TEXT NOT NULL DEFAULT 'empty_after_3_scans',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE CASCADE,
+    UNIQUE(show_id, pwd_id)
+);
+CREATE INDEX IF NOT EXISTS idx_share_blacklist_show_pwd ON share_blacklist(show_id,pwd_id);
+SQL
+
+changed_pool=0
+for spec in \
+    "shows:share_scan_rank" \
+    "shows:discovery_cursor" \
+    "shares:seedhub_entry_url" \
+    "shares:pool_type" \
+    "shares:pending_probe_count" \
+    "shares:used_count" \
+    "shares:last_used_at"; do
+    table="${spec%%:*}"
+    column="${spec#*:}"
+    if ! sqlite_check_column "$table" "$column"; then
+        case "$table:$column" in
+            shows:share_scan_rank) definition="INTEGER DEFAULT 0" ;;
+            shows:discovery_cursor) definition="INTEGER NOT NULL DEFAULT 20" ;;
+            shares:seedhub_entry_url) definition="TEXT" ;;
+            shares:pool_type) definition="TEXT NOT NULL DEFAULT 'front20'" ;;
+            shares:pending_probe_count) definition="INTEGER NOT NULL DEFAULT 0" ;;
+            shares:used_count) definition="INTEGER NOT NULL DEFAULT 0" ;;
+            shares:last_used_at) definition="TEXT" ;;
+        esac
+        sqlite3 "$DB" "ALTER TABLE $table ADD COLUMN $column $definition;" || exit 1
+        [ "$table:$column" = "shares:pool_type" ] && changed_pool=1
+    fi
+done
+
+# 仅在迁移第一次添加 pool_type 时按旧 rank 初始化；以后绝不覆盖动态 pool_type。
+if [ "$changed_pool" -eq 1 ]; then
+    sqlite3 "$DB" "UPDATE shares SET pool_type=CASE WHEN COALESCE(seedhub_rank,999999) BETWEEN 1 AND 20 THEN 'front20' ELSE 'overflow' END;" || exit 1
+fi
+
+# 新字段迁移完成后再验证，避免旧数据库在迁移之前被提前拒绝。
+for spec in \
+    "shares:seedhub_entry_url" \
+    "shares:pool_type" \
+    "shares:pending_probe_count" \
+    "shares:used_count" \
+    "shares:last_used_at"; do
+    table="${spec%%:*}"
+    column="${spec#*:}"
+    if ! sqlite_check_column "$table" "$column"; then
+        error "数据库表 $table 缺少字段：$column"
+        echo "ERROR: $table 缺少字段 $column" >&2
+        exit 1
+    fi
+done
+
+sqlite3 "$DB" "CREATE INDEX IF NOT EXISTS idx_shares_show_pool_rank ON shares(show_id,pool_type,seedhub_rank); CREATE INDEX IF NOT EXISTS idx_shares_show_entry ON shares(show_id,seedhub_entry_url);" || exit 1
+
+# 旧 valid + 0文件记录转成 pending，避免历史数据继续触发“0文件优先重扫”。
+sqlite3 "$DB" <<'SQL'
+PRAGMA busy_timeout=10000;
+UPDATE shares
+   SET status='pending',
+       pending_probe_count=CASE WHEN COALESCE(pending_probe_count,0)<1 THEN 1 ELSE pending_probe_count END,
+       fail_count=0,
+       last_success=NULL,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE status='valid'
+   AND COALESCE(pending_probe_count,0)=0
+   AND last_success IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM share_files sf WHERE sf.share_id=shares.id);
+SQL
+
 
 CURL_TLS_ARGS=()
 
@@ -479,6 +565,7 @@ PRAGMA busy_timeout=10000;
 BEGIN IMMEDIATE;
 UPDATE shares
    SET status='valid',
+       pending_probe_count=0,
        fail_count=0,
        last_check=CURRENT_TIMESTAMP,
        last_success=CURRENT_TIMESTAMP,
@@ -490,9 +577,16 @@ SQL
 
 mark_share_failure() {
     local share_id="$1"
-    local sql_file
-    sql_file="$TMP_ROOT/fail-${share_id}.sql"
+    local current_status
+    current_status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
 
+    # Pending 的失败不是“第几次空目录”；不消耗三次机会，也不进入 dead。
+    if [ "$current_status" = "pending" ]; then
+        sqlite3 "$DB" "UPDATE shares SET last_check=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$share_id");"
+        return 0
+    fi
+
+    local sql_file="$TMP_ROOT/fail-${share_id}.sql"
     cat > "$sql_file" <<SQL
 PRAGMA busy_timeout=10000;
 BEGIN IMMEDIATE;
@@ -508,8 +602,82 @@ UPDATE shares
    AND COALESCE(fail_count,0) >= $((SHARE_DEAD_FAIL_COUNT));
 COMMIT;
 SQL
-
     sqlite3 "$DB" < "$sql_file"
+}
+
+mark_share_empty() {
+    local share_id="$1"
+    local show_id="$2"
+    local url="$3"
+    local pwd_id="$4"
+    local seedhub_entry_url
+    local seedhub_rank
+    local probe_count
+    local current_status
+    local pending_replace
+
+    current_status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    [ "$current_status" != "excluded" ] || return 0
+
+    seedhub_entry_url="$(sqlite3 "$DB" "SELECT COALESCE(seedhub_entry_url,'') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    seedhub_rank="$(sqlite3 "$DB" "SELECT COALESCE(seedhub_rank,'') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    probe_count="$(sqlite3 "$DB" "SELECT COALESCE(pending_probe_count,0)+1 FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+    [[ "$probe_count" =~ ^[0-9]+$ ]] || probe_count=1
+
+    if [ "$probe_count" -ge "$PENDING_MAX_CHECKS" ]; then
+        pending_replace="$(sqlite3 "$DB" "SELECT COUNT(*) FROM replace_queue WHERE source_share_id=$(sql_quote "$share_id") AND status='running';")"
+        if [ "${pending_replace:-0}" -gt 0 ]; then
+            # 极端并发情况下不删除正在执行替换任务依赖的 Share；下一轮仍允许再次判断。
+            sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+UPDATE shares SET status='pending', pending_probe_count=CASE WHEN $PENDING_MAX_CHECKS>1 THEN $((PENDING_MAX_CHECKS-1)) ELSE 0 END, last_check=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$share_id");
+SQL
+            warn "空 Share 已达到最大尝试，但存在 running replace，暂不删除：share_id=$share_id"
+            return 0
+        fi
+
+        if ! sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+BEGIN IMMEDIATE;
+INSERT INTO share_blacklist(show_id,pwd_id,url,seedhub_entry_url,reason,created_at)
+VALUES($(sql_quote "$show_id"),$(sql_quote "$pwd_id"),$(sql_quote "$url"),$(sql_quote "$seedhub_entry_url"),'empty_after_3_scans',CURRENT_TIMESTAMP)
+ON CONFLICT(show_id,pwd_id) DO UPDATE SET
+    url=excluded.url,
+    seedhub_entry_url=excluded.seedhub_entry_url,
+    reason=excluded.reason,
+    created_at=CURRENT_TIMESTAMP;
+DELETE FROM share_files WHERE share_id=$(sql_quote "$share_id");
+DELETE FROM shares WHERE id=$(sql_quote "$share_id") AND show_id=$(sql_quote "$show_id");
+COMMIT;
+SQL
+        then
+            log "SOURCE淘汰空 Share：share_id=$share_id show_id=$show_id rank=${seedhub_rank:-} url=$url 已达到 ${PENDING_MAX_CHECKS} 次空目录扫描，加入黑名单"
+            return 0
+        fi
+        error "写入空 Share 黑名单或删除记录失败：share_id=$share_id url=$url"
+        return 1
+    fi
+
+    if ! sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+BEGIN IMMEDIATE;
+DELETE FROM share_files WHERE share_id=$(sql_quote "$share_id");
+UPDATE shares
+   SET status='pending',
+       pending_probe_count=$probe_count,
+       fail_count=0,
+       last_check=CURRENT_TIMESTAMP,
+       last_success=NULL,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE id=$(sql_quote "$share_id") AND show_id=$(sql_quote "$show_id");
+COMMIT;
+SQL
+    then
+        log "SOURCE空 Share 转待定：share_id=$share_id show_id=$show_id probe=$probe_count/$PENDING_MAX_CHECKS next_after=${PENDING_RECHECK_HOURS}h url=$url"
+        return 0
+    fi
+    error "更新 Pending Share 状态失败：share_id=$share_id"
+    return 1
 }
 
 replace_share_cache() {
@@ -574,6 +742,11 @@ process_share() {
         return 1
     fi
 
+    if sqlite3 "$DB" "SELECT 1 FROM share_blacklist WHERE show_id=$(sql_quote "$show_id") AND pwd_id=$(sql_quote "$pwd_id") LIMIT 1;" | grep -qx 1; then
+        log "SOURCE跳过黑名单 Share：share_id=$share_id show_id=$show_id url=$url"
+        return 0
+    fi
+
     stoken="$(get_stoken "$url" "$pwd_id" || true)"
 
     if [ -z "$stoken" ]; then
@@ -610,6 +783,12 @@ process_share() {
 
     after_count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM share_files WHERE share_id=$(sql_quote "$share_id");")"
     episode_count="$(awk -F '\t' '{seen[$1]=1} END {print length(seen)+0}' "$scan_file")"
+
+    if [ "$episode_count" -eq 0 ]; then
+        mark_share_empty "$share_id" "$show_id" "$url" "$pwd_id"
+        log "SOURCE扫描成功但无有效剧集：share_id=$share_id rank=$seedhub_rank files=0"
+        return 0
+    fi
 
     mark_share_success "$share_id" || {
         error "shares 状态更新失败：share_id=$share_id"

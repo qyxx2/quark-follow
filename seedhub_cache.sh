@@ -14,12 +14,20 @@ log() {
     printf '[%s] [PARSE] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
 }
 
-if [ $# -ne 1 ]; then
-    log "ERROR: 用法: $0 <SeedHub一级页面URL>"
+if [ "$#" -ne 1 ] && [ "$#" -ne 4 ]; then
+    log "ERROR: 用法: $0 <SeedHub一级页面URL> [--range <start_rank> <count>]"
     exit 2
 fi
 
 MOVIE_URL="$1"
+shift
+
+if [ "$#" -ne 0 ]; then
+    if [ "$#" -ne 3 ] || [ "$1" != "--range" ]; then
+        log "ERROR: 可选参数必须是：--range <start_rank> <count>"
+        exit 2
+    fi
+fi
 
 RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
 
@@ -33,8 +41,8 @@ if ! docker exec "$CONTAINER" test -f /work/seedhub_cache.py; then
     exit 1
 fi
 
-log "INFO: 开始解析 SeedHub 页面：$MOVIE_URL"
+log "INFO: 开始解析 SeedHub 页面：$MOVIE_URL${*:+ 参数=$*}"
 docker exec \
     -e DISPLAY=:99 \
     "$CONTAINER" \
-    python3 /work/seedhub_cache.py "$MOVIE_URL" >> "$LOG_FILE" 2>&1
+    python3 /work/seedhub_cache.py "$MOVIE_URL" "$@" >> "$LOG_FILE" 2>&1
