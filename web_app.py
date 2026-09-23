@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import subprocess
 import threading
+import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -179,31 +180,58 @@ PROCESS_DEFINITIONS = [
 ]
 
 
+_PROCESS_SNAPSHOT_TTL = 0.5
+_process_snapshot_cache = None
+_process_snapshot_cache_at = 0.0
+_process_snapshot_lock = threading.Lock()
+
+
+def _invalidate_process_snapshot_cache():
+    global _process_snapshot_cache, _process_snapshot_cache_at
+    with _process_snapshot_lock:
+        _process_snapshot_cache = None
+        _process_snapshot_cache_at = 0.0
+
+
 def _process_snapshot():
-    """Scan /proc once and collect matches for every UI-visible backend script."""
-    needles = {key: str(BASE / script) for key, script, _label in PROCESS_DEFINITIONS}
-    result = {key: [] for key in needles}
-    own_pid = os.getpid()
+    """Return a short-lived snapshot of all UI-visible backend processes."""
+    global _process_snapshot_cache, _process_snapshot_cache_at
 
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            pid = int(proc.name)
-            if pid == own_pid:
-                continue
-            raw = (proc / "cmdline").read_bytes()
-            cmd_parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
-            if not cmd_parts:
-                continue
-            cmd = " ".join(cmd_parts)
-            for key, needle in needles.items():
-                if needle in cmd:
-                    result[key].append({"pid": pid, "cmd": cmd_parts})
-        except (OSError, ValueError):
-            pass
+    now = time.monotonic()
+    if _process_snapshot_cache is not None and now - _process_snapshot_cache_at < _PROCESS_SNAPSHOT_TTL:
+        return _process_snapshot_cache
 
-    for matches in result.values():
-        matches.sort(key=lambda item: item["pid"])
-    return result
+    with _process_snapshot_lock:
+        now = time.monotonic()
+        if _process_snapshot_cache is not None and now - _process_snapshot_cache_at < _PROCESS_SNAPSHOT_TTL:
+            return _process_snapshot_cache
+
+        needles = {key: str(BASE / script) for key, script, _label in PROCESS_DEFINITIONS}
+        result = {key: [] for key in needles}
+        own_pid = os.getpid()
+
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                pid = int(proc.name)
+                if pid == own_pid:
+                    continue
+                raw = (proc / "cmdline").read_bytes()
+                cmd_parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+                if not cmd_parts:
+                    continue
+                cmd = " ".join(cmd_parts)
+                for key, needle in needles.items():
+                    if needle in cmd:
+                        result[key].append({"pid": pid, "cmd": cmd_parts})
+            except (OSError, ValueError):
+                pass
+
+        for matches in result.values():
+            matches.sort(key=lambda item: item["pid"])
+
+        _process_snapshot_cache = result
+        _process_snapshot_cache_at = time.monotonic()
+        return result
 
 
 def process_matches(script, snapshot=None):
@@ -517,7 +545,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body data-page='{{ page_name|default("") }}'><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;if(document.body.dataset.page==='dashboard')return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -543,6 +571,15 @@ def index():
         BASE_TEMPLATE + """<h1>系统概览</h1><div id='dashboard'></div><p class='muted'>页面每 3 秒刷新；运行状态根据实际锁目录及进程检测。</p><script>
 let webRestarting=false;
 const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+const runningTaskRoot=document.getElementById('running-tasks');
+const renderRunningTasks=tasks=>{
+  if(!runningTaskRoot)return;
+  const active=Object.values(tasks||{}).filter(x=>x.process_running);
+  runningTaskRoot.innerHTML=active.map(x=>{
+    const target=String(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');
+    return `<span class=task-pill><span class=task-dot></span>${esc(x.label)}${target?' · '+esc(target):''}</span>`;
+  }).join('');
+};
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function waitForWeb(oldPid){
   for(let i=0;i<45;i++){
@@ -587,6 +624,7 @@ async function load(){
   if(webRestarting)return;
   try{
     let d=await fetch('/api/dashboard?ts='+Date.now(),{cache:'no-store'}).then(r=>r.json());
+    renderRunningTasks(d.tasks);
     let t=d.tasks.resource_check;let q=d.queue;
     document.querySelector('#dashboard').innerHTML=`
       <div class=grid>
@@ -601,7 +639,8 @@ async function load(){
   }catch(e){}
 }
 load();setInterval(load,3000);
-</script></main>"""
+</script></main>""",
+        page_name='dashboard'
     )
 
 @app.route('/api/dashboard')
@@ -640,6 +679,7 @@ def restart_web():
                     start_new_session=True,
                     close_fds=True,
                 )
+            _invalidate_process_snapshot_cache()
             web_restart_requested = True
         except OSError as exc:
             write_web_log("ERROR", f"Web 重启启动器启动失败：current_pid={current_pid} error={exc}")
@@ -1041,6 +1081,7 @@ def start_task(script, args, label=None):
                         start_new_session=True,
                         close_fds=True,
                     )
+                _invalidate_process_snapshot_cache()
                 write_web_log('INIT', f"后台任务已启动：script={script} pid={child.pid} args={' '.join(args)} label={label or script}")
                 flash(f'已在后台启动“{label or script}”。')
             except OSError as exc:
