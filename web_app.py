@@ -169,37 +169,113 @@ def db_query(sql, args=(), one=False):
             con.close()
 
 
-def process_for(script):
-    needle = str(BASE / script)
+PROCESS_DEFINITIONS = [
+    ("resource_check", "resource_check.sh", "资源检查"),
+    ("source_check", "source_check.sh", "数据库同步"),
+    ("seedhub_cache", "seedhub_cache.sh", "SeedHub 解析"),
+    ("addfile", "addfile.sh", "补缺转存"),
+    ("replace", "replace.sh", "替换"),
+    ("web_restart", "restart-web.sh", "Web 重启"),
+]
+
+
+def _process_snapshot():
+    """Scan /proc once and collect matches for every UI-visible backend script."""
+    needles = {key: str(BASE / script) for key, script, _label in PROCESS_DEFINITIONS}
+    result = {key: [] for key in needles}
+    own_pid = os.getpid()
+
     for proc in Path("/proc").glob("[0-9]*"):
         try:
-            cmd = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore")
-            if needle in cmd and proc.name != str(os.getpid()):
-                return int(proc.name)
+            pid = int(proc.name)
+            if pid == own_pid:
+                continue
+            raw = (proc / "cmdline").read_bytes()
+            cmd_parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+            if not cmd_parts:
+                continue
+            cmd = " ".join(cmd_parts)
+            for key, needle in needles.items():
+                if needle in cmd:
+                    result[key].append({"pid": pid, "cmd": cmd_parts})
         except (OSError, ValueError):
             pass
-    return None
 
-
-def task_status():
-    result = {}
-    for name, lock in LOCKS.items():
-        script = "resource_check.sh" if name == "resource_check" else "replace.sh"
-        pid = process_for(script)
-        result[name] = {"running": lock.exists() or pid is not None, "pid": pid, "lock": lock.exists()}
+    for matches in result.values():
+        matches.sort(key=lambda item: item["pid"])
     return result
 
 
-def background_work_running():
-    state = task_status()
-    if state["resource_check"]["running"]:
-        return "resource_check"
-    if process_for("source_check.sh") is not None:
-        return "source_check"
-    if process_for("addfile.sh") is not None:
-        return "addfile"
-    if state["replace"]["running"]:
-        return "replace"
+def process_matches(script, snapshot=None):
+    if snapshot is None:
+        snapshot = _process_snapshot()
+    for key, candidate, _label in PROCESS_DEFINITIONS:
+        if candidate == script:
+            return snapshot.get(key, [])
+    # Preserve the previous generic lookup behavior for callers using a script
+    # not listed in PROCESS_DEFINITIONS.
+    needle = str(BASE / script)
+    matches = []
+    own_pid = os.getpid()
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(proc.name)
+            if pid == own_pid:
+                continue
+            raw = (proc / "cmdline").read_bytes()
+            cmd_parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+            if needle in " ".join(cmd_parts):
+                matches.append({"pid": pid, "cmd": cmd_parts})
+        except (OSError, ValueError):
+            pass
+    return sorted(matches, key=lambda item: item["pid"])
+
+
+def process_for(script, snapshot=None):
+    matches = process_matches(script, snapshot)
+    return matches[0]["pid"] if matches else None
+
+
+def process_target(cmd_parts):
+    for flag in ("--show-id", "--share-id"):
+        if flag in cmd_parts:
+            idx = cmd_parts.index(flag)
+            if idx + 1 < len(cmd_parts):
+                return f"{flag} {cmd_parts[idx + 1]}"
+    return ""
+
+
+def task_status(snapshot=None):
+    if snapshot is None:
+        snapshot = _process_snapshot()
+    result = {}
+    lock_for = {"resource_check": LOCKS["resource_check"], "replace": LOCKS["replace"]}
+    for key, script, label in PROCESS_DEFINITIONS:
+        matches = process_matches(script, snapshot)
+        lock_path = lock_for.get(key)
+        lock_exists = bool(lock_path and lock_path.exists())
+        result[key] = {
+            "label": label,
+            "script": script,
+            # running includes a known lock for safety. process_running is what
+            # the header uses, so a stale lock will not be shown as a running process.
+            "running": bool(matches) or lock_exists,
+            "process_running": bool(matches),
+            "pid": matches[0]["pid"] if matches else None,
+            "pids": [item["pid"] for item in matches],
+            "target": process_target(matches[0]["cmd"]) if matches else "",
+            "lock": lock_exists,
+            "lock_only": lock_exists and not matches,
+        }
+    return result
+
+
+def background_work_running(state=None):
+    if state is None:
+        state = task_status()
+    for key in ("resource_check", "source_check", "seedhub_cache", "addfile", "replace"):
+        if state[key]["running"]:
+            return key
     return None
 
 
@@ -399,6 +475,7 @@ def latest_resource_run():
 
 
 def dashboard_data():
+    task_state = task_status()
     shows = db_query("SELECT COUNT(*) AS n FROM shows", one=True) or {"n": 0}
     shares = db_query(
         "SELECT COUNT(*) AS total, SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) AS dead FROM shares",
@@ -408,7 +485,8 @@ def dashboard_data():
     counts = {row["status"]: row["n"] for row in queue}
     latest = latest_resource_run()
     return {
-        "tasks": task_status(),
+        "tasks": task_state,
+        "busy": background_work_running(task_state),
         "show_count": shows["n"],
         "share_count": shares.get("total") or 0,
         "dead_shares": shares.get("dead") or 0,
@@ -439,7 +517,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:13px max(16px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}nav{display:flex;gap:12px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}@media(max-width:560px){header{align-items:flex-start;flex-direction:column}th,td{padding:7px 5px}.container{padding:10px}}</style><body><header><strong>quark-follow</strong><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -518,7 +596,7 @@ async function load(){
         <div class=card><div class=label>Share / dead</div><div class=metric>${d.share_count} / ${d.dead_shares}</div></div>
         <div class=card><div class=label>替换队列</div><div>pending ${q.pending} · running ${q.running}<br>success ${q.success} · failed ${q.failed}</div></div>
       </div>
-      <div class=card><div class=label>最近一次 resource_check</div>${d.last_run||'暂无'} · ${d.last_result}<div class=actions style="margin-top:12px"><form method=post action='/tasks/resource-check'><button ${t.running?'disabled':''}>立即运行 resource_check</button></form></div></div>
+      <div class=card><div class=label>最近一次 resource_check</div>${d.last_run||'暂无'} · ${d.last_result}<div class=actions style="margin-top:12px"><form method=post action='/tasks/resource-check'><button ${d.busy?'disabled':''}>立即运行 resource_check</button></form></div></div>
       <section class=card><h2>最近事件</h2>${d.events.map(e=>`<div class=event><span class=tag>${e.category}</span> <span class=muted>${esc(e.time)} ${esc(e.source)}</span><br>${esc(e.message)}</div>`).join('')||'暂无日志'}</section>`;
   }catch(e){}
 }
@@ -530,6 +608,12 @@ load();setInterval(load,3000);
 @login_required
 def api_dashboard():
     return jsonify(dashboard_data())
+
+
+@app.route('/api/tasks')
+@login_required
+def api_tasks():
+    return jsonify({"tasks": task_status()})
 
 @app.post('/tasks/web-restart')
 @login_required
@@ -627,7 +711,7 @@ def resource_detail(show_id):
 
     missing = [x for x in range(1, total + 1) if x not in owned]
     return render_template_string(
-        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class=actions><form method=post action='/tasks/source-check/show/{{show.id}}'><button>重新扫描此资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\n\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\nWebDAV 中已经存在的文件不会删除。\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
+        BASE_TEMPLATE + """<h1>{{show.name}}</h1><div class=card><p><b>SeedHub：</b><a href='{{show.seedhub_url}}' rel=noopener>{{show.seedhub_url}}</a></p><p><b>WebDAV：</b>{{show.webdav_path}}</p><p>总集数 {{total}} · 当前集数 {{owned|length}} · 缺失 {{missing|length}}</p><p class=muted>缺失集：{{ missing|join(', ') if missing else '无' }}</p><div class='actions task-actions'><form method=post action='/tasks/source-check/show/{{show.id}}'><button class=secondary>数据库同步</button></form><form method=post action='/tasks/resource-recheck/{{show.id}}'><button>重新检查资源</button></form><form method=post action='/resources/{{show.id}}/delete' onsubmit="return confirm('确定删除此资源？\n\n将删除数据库中的资源及缓存，并从 resources.json 中移除追踪记录。\nWebDAV 中已经存在的文件不会删除。\n此操作不可撤销。');"><button type=submit class=danger>删除资源</button></form></div></div><div class=tablewrap><table><tr><th>rank</th><th>share id</th><th>Share URL</th><th>状态</th><th>失败</th><th>集数统计</th><th>操作</th></tr>{% for s in shares %}<tr><td>{{s.seedhub_rank}}</td><td>{{s.id}}</td><td><a class=url href='{{s.url}}' rel=noopener>{{s.url}}</a></td><td>{{s.status}}</td><td>{{s.fail_count}}</td><td>{{s.episode_count}} 集 / {{s.file_count}} 文件</td><td>{% if s.status == 'excluded' %}<span class=bad>已排除</span>{% else %}<form method=post action='/tasks/source-check/share/{{s.id}}'><button>重扫</button></form><form method=post action='/resources/{{show.id}}/shares/{{s.id}}/exclude'><button type=submit class=danger>排除</button></form>{% endif %}</td></tr>{% endfor %}</table></div></main>""",
         show=show,
         shares=shares,
         total=total,
@@ -896,39 +980,72 @@ def add_resource():
 @app.post('/tasks/resource-check')
 @login_required
 def start_resource_check():
-    return start_task('resource_check.sh', [])
+    return start_task('resource_check.sh', [], 'resource_check')
+
+@app.post('/tasks/resource-recheck/<int:show_id>')
+@login_required
+def start_resource_recheck(show_id):
+    show = db_query("SELECT id, name, seedhub_url FROM shows WHERE id=?", (show_id,), True)
+    if not show:
+        abort(404)
+
+    if not RESOURCES.exists():
+        flash('resources.json 不存在，无法重新检查此资源。')
+        return redirect(url_for('resource_detail', show_id=show_id))
+
+    try:
+        data = json.loads(RESOURCES.read_text(encoding='utf-8'))
+        entries = data.get('resources') if isinstance(data, dict) else data
+        tracked = (
+            isinstance(entries, list)
+            and any(isinstance(item, dict) and item.get('url') == show['seedhub_url'] for item in entries)
+        )
+    except (OSError, json.JSONDecodeError):
+        tracked = False
+
+    if not tracked:
+        flash('该资源不在 resources.json 追踪列表中，未启动重新检查。')
+        return redirect(url_for('resource_detail', show_id=show_id))
+
+    return start_task('resource_check.sh', ['--show-id', str(show_id)], '重新检查资源')
 
 @app.post('/tasks/source-check/<kind>/<int:target_id>')
 @login_required
 def start_source_check(kind, target_id):
     if kind not in ('show','share'):
         abort(404)
-    if task_status()['resource_check']['running'] or process_for('source_check.sh'):
-        flash('已有资源检查或 Share 扫描任务在运行。')
-        return redirect(request.referrer or url_for('index'))
-    return start_task('source_check.sh', [f'--{kind}-id', str(target_id)])
+    return start_task('source_check.sh', [f'--{kind}-id', str(target_id)], '数据库同步')
 
-def start_task(script, args):
+def start_task(script, args, label=None):
     with launch_lock:
         state = task_status()
-        if state['resource_check']['running'] or (script == 'replace.sh' and state['replace']['running']):
-            flash('检测到冲突锁或运行进程，未启动重复任务。')
+        busy = background_work_running(state)
+        if busy:
+            display = state.get(busy, {}).get('label', busy)
+            flash(f'当前有“{display}”任务正在运行，不能启动新的后台任务。')
+            write_web_log('WARN', f"后台任务启动被拒绝：script={script} args={' '.join(args)} reason={busy}_running")
         elif not (BASE / script).is_file():
             flash('脚本不存在，未启动。')
+            write_web_log('ERROR', f"后台任务启动失败：脚本不存在：{BASE / script}")
         else:
             log = LOG_DIR / 'web_launcher.log'
             LOG_DIR.mkdir(exist_ok=True)
-            with log.open('ab') as output:
-                subprocess.Popen(
-                    [str(BASE / script), *args],
-                    cwd=BASE,
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            flash(f'已在后台启动 {script}。')
+            try:
+                with log.open('ab') as output:
+                    child = subprocess.Popen(
+                        [str(BASE / script), *args],
+                        cwd=BASE,
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                write_web_log('INIT', f"后台任务已启动：script={script} pid={child.pid} args={' '.join(args)} label={label or script}")
+                flash(f'已在后台启动“{label or script}”。')
+            except OSError as exc:
+                write_web_log('ERROR', f"后台任务启动失败：script={script} args={' '.join(args)} error={exc}")
+                flash(f'后台任务启动失败：{exc}')
     return redirect(request.referrer or url_for('index'))
 
 @app.route('/api-stats')
@@ -964,12 +1081,27 @@ def api_stats_page():
         function render(d){
           let root=document.querySelector('#stats');
           if(!d.available){root.innerHTML=`<div class=card><h2>统计暂不可用</h2><p class=bad>${esc(d.error||'未知错误')}</p></div>`;return;}
+          const openDetails=[...root.querySelectorAll('details')].map(x=>x.open);
           let ops=d.operations?.['24h']||[];
           let rows=ops.map(x=>`<tr><td>${esc(serviceName(x.service))}</td><td><code>${esc(x.operation)}</code><br><span class=muted>${esc(opName(x.service,x.operation))}</span></td><td>${fmt(x.calls)}</td><td>${fmt(x.failures)}</td></tr>`).join('');
-          let timeline=(d.timeline||[]).map(x=>{
-            let q=Number(x.quark||0), h=Number(x.seedhub||0), total=Math.max(q,h,1);
-            return `<tr><td>${esc(x.time)}</td><td>${fmt(q)}</td><td>${fmt(h)}</td><td>${fmt(q+h)}</td><td><div style="min-width:160px"><div style="height:8px;background:#e8eefc;border-radius:5px;overflow:hidden"><div style="height:8px;width:${Math.min(100,(q/total)*100)}%;background:#2364d2"></div></div><div style="height:8px;background:#f2e7d3;border-radius:5px;overflow:hidden;margin-top:3px"><div style="height:8px;width:${Math.min(100,(h/total)*100)}%;background:#aa6900"></div></div></div></td></tr>`;
-          }).join('');
+          const detailTable=`<div class=tablewrap><table><tr><th>服务</th><th>接口</th><th>调用次数</th><th>失败次数</th></tr>${rows||'<tr><td colspan=4>最近 24 小时暂无统计。</td></tr>'}</table></div>`;
+          const todayKey=String(d.generated_at||'').slice(5,10);
+          const timelineRows=(d.timeline||[])
+            .filter(x=>Number(x.quark||0)+Number(x.seedhub||0)>0)
+            .map((x,i,a)=>{
+              let q=Number(x.quark||0), h=Number(x.seedhub||0), total=Math.max(q,h,1);
+              let prev=a[i-1];
+              let currentDate=String(x.time||'').slice(0,5);
+              let prevDate=prev?String(prev.time||'').slice(0,5):'';
+              let label=String(x.time||'').slice(-5);
+              let separator='';
+              if(i===0 || currentDate!==prevDate){
+                let dayLabel=currentDate===todayKey?'今天':'昨天';
+                separator=`<tr><th colspan=5 class=day-separator>${dayLabel}</th></tr>`;
+              }
+              return separator+`<tr><td>${esc(label)}</td><td>${fmt(q)}</td><td>${fmt(h)}</td><td>${fmt(q+h)}</td><td><div style="min-width:160px"><div style="height:8px;background:#e8eefc;border-radius:5px;overflow:hidden"><div style="height:8px;width:${Math.min(100,(q/total)*100)}%;background:#2364d2"></div></div><div style="height:8px;background:#f2e7d3;border-radius:5px;overflow:hidden;margin-top:3px"><div style="height:8px;width:${Math.min(100,(h/total)*100)}%;background:#aa6900"></div></div></div></td></tr>`;
+            }).join('');
+          const timeline=timelineRows;
           root.innerHTML=`
             <div class=grid>
               ${card('最近 1 分钟',d.summary?.['1m'])}
@@ -977,9 +1109,16 @@ def api_stats_page():
               ${card('最近 24 小时',d.summary?.['24h'])}
               ${card('今日',d.summary?.today)}
             </div>
-            <div class=card><div class=label>24 小时调用明细</div><div class=tablewrap><table><tr><th>服务</th><th>接口</th><th>调用次数</th><th>失败次数</th></tr>${rows||'<tr><td colspan=4>最近 24 小时暂无统计。</td></tr>'}</table></div></div>
-            <div class=card><div class=label>最近 24 小时逐小时调用量</div><div class=tablewrap><table><tr><th>时间</th><th>Quark</th><th>SeedHub</th><th>合计</th><th>相对量</th></tr>${timeline||'<tr><td colspan=5>暂无统计。</td></tr>'}</table></div></div>
+            <details class=card>
+              <summary style="cursor:pointer;font-weight:600">24 小时调用明细</summary>
+              <div style="margin-top:12px">${detailTable}</div>
+            </details>
+            <details class=card>
+              <summary style="cursor:pointer;font-weight:600">最近 24 小时逐小时调用量</summary>
+              <div style="margin-top:12px"><div class=tablewrap><table><tr><th>时间</th><th>Quark</th><th>SeedHub</th><th>合计</th><th>相对量</th></tr>${timeline||'<tr><td colspan=5>最近 24 小时暂无调用。</td></tr>'}</table></div></div>
+            </details>
             <div class=muted style="margin:6px 0 18px">最后更新：${esc(d.generated_at||'')} · 统计数据库保留 ${fmt(d.retention_days)} 天</div>`;
+          [...root.querySelectorAll('details')].forEach((el,i)=>{ if(openDetails[i]) el.open=true; });
         }
         async function loadStats(){
           try{

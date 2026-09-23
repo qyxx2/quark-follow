@@ -38,7 +38,7 @@
 #   - Quark 转存/补缺细节               -> addfile.sh
 #   - 替换执行                           -> replace.sh
 #
-# 本脚本没有 --test / --dry-run / --show-id 等额外入口。
+# 默认处理 resources.json 全部资源；支持 --show-id 仅重新检查指定资源。
 # ============================================================
 
 set -u
@@ -162,13 +162,41 @@ done
 [ "$RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX" -ge 1 ] || { error "RESOURCE_EXTRA_DISCOVERY_FAILURE_MAX 必须 >= 1"; exit 2; }
 
 # ============================================================
-# 唯一入口：不接受额外参数
+# 命令行入口
+#
+# 默认：处理 resources.json 中的全部资源。
+# --show-id N：只处理数据库中的指定资源；其它自动检查逻辑完全不变。
 # ============================================================
 
-if [ "$#" -ne 0 ]; then
-    echo "ERROR: resource_check.sh 不接受命令行参数；请只修改 resources.json 和 config.local。" >&2
-    exit 2
-fi
+SHOW_ID_FILTER=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --show-id)
+            [ "$#" -ge 2 ] || { echo "ERROR: --show-id 缺少参数" >&2; exit 2; }
+            case "$2" in
+                ''|*[!0-9]*) echo "ERROR: --show-id 必须是正整数：$2" >&2; exit 2 ;;
+            esac
+            [ "$2" -ge 1 ] || { echo "ERROR: --show-id 必须 >= 1" >&2; exit 2; }
+            SHOW_ID_FILTER="$2"
+            shift 2
+            ;;
+        -h|--help)
+            cat <<HELP
+用法：
+  ./resource_check.sh                 检查 resources.json 中全部资源
+  ./resource_check.sh --show-id 5     只重新检查 shows.id=5 对应资源
+
+单资源模式仍执行完整资源检查流程：SeedHub 同步、WebDAV 扫描、缺集判断、
+Share 验证/探索、tasks 生成、addfile 补缺及必要的最终验证。
+HELP
+            exit 0
+            ;;
+        *)
+            echo "ERROR: 未知参数：$1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ============================================================
 # 全局锁
@@ -1775,11 +1803,29 @@ process_resource() {
 # ============================================================
 
 RESOURCES_LIST="$TMP_ROOT/resources.jsonl"
-jq -c '(.resources? // .)[]' "$RESOURCES_FILE" > "$RESOURCES_LIST"
 
-if [ ! -s "$RESOURCES_LIST" ]; then
-    error "resources.json 没有资源条目"
-    exit 2
+if [ -n "$SHOW_ID_FILTER" ]; then
+    TARGET_SHOW_URL="$(sqlite3 "$DB" "SELECT COALESCE(seedhub_url,'') FROM shows WHERE id=$(sql_quote "$SHOW_ID_FILTER") LIMIT 1;")"
+    if [ -z "$TARGET_SHOW_URL" ]; then
+        error "找不到指定资源：shows.id=$SHOW_ID_FILTER"
+        exit 2
+    fi
+
+    jq -c --arg target_url "$TARGET_SHOW_URL" '(.resources? // .)[] | select(.url == $target_url)' "$RESOURCES_FILE" > "$RESOURCES_LIST"
+
+    if [ ! -s "$RESOURCES_LIST" ]; then
+        error "指定资源不在 resources.json 追踪列表中：show_id=$SHOW_ID_FILTER url=$TARGET_SHOW_URL"
+        exit 2
+    fi
+
+    info "单资源模式：只处理 show_id=$SHOW_ID_FILTER url=$TARGET_SHOW_URL"
+else
+    jq -c '(.resources? // .)[]' "$RESOURCES_FILE" > "$RESOURCES_LIST"
+
+    if [ ! -s "$RESOURCES_LIST" ]; then
+        error "resources.json 没有资源条目"
+        exit 2
+    fi
 fi
 
 TOTAL=0 SUCCESS=0 READY=0 UNRESOLVED=0 FAILED=0
