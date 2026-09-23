@@ -443,8 +443,8 @@ def detect_total_episodes(page):
         body_text = normalize_text(body_text)
 
         patterns = [
-            r'集\s*数\s*[:：](\d+)',
-            r'集数\s*[:：](\d+)',
+            r'集\s*数\s*[:：]\s*(\d+)',
+            r'集数\s*[:：]\s*(\d+)',
         ]
 
         for pattern in patterns:
@@ -580,7 +580,7 @@ def ensure_schema(conn):
             reason TEXT NOT NULL DEFAULT 'empty_after_3_scans',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (show_id) REFERENCES shows(id) ON DELETE CASCADE,
-            UNIQUE(show_id, pwd_id)
+            UNIQUE(show_id,pwd_id)
         )
     """)
 
