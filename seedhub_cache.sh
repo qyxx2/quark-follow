@@ -5,6 +5,21 @@ CONTAINER="seedhub-playwright"
 LOG_DIR_DEFAULT="$BASE_DIR/logs"
 LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 LOG_FILE="$LOG_DIR/seedhub_cache.log"
+CONFIG="$BASE_DIR/config.local"
+
+# 只读取低频二级入口确认相关的两个数值配置；不向容器传递 Cookie/Token。
+ENTRY_RECHECK_HOURS=72
+ENTRY_RECHECK_MAX=2
+
+if [ -f "$CONFIG" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    ENTRY_RECHECK_HOURS="${RESOURCE_SEEDHUB_ENTRY_RECHECK_HOURS:-72}"
+    ENTRY_RECHECK_MAX="${RESOURCE_SEEDHUB_ENTRY_RECHECK_MAX:-2}"
+fi
+
+[[ "$ENTRY_RECHECK_HOURS" =~ ^[0-9]+$ ]] || ENTRY_RECHECK_HOURS=72
+[[ "$ENTRY_RECHECK_MAX" =~ ^[0-9]+$ ]] || ENTRY_RECHECK_MAX=2
 
 mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
@@ -44,5 +59,7 @@ fi
 log "INFO: 开始解析 SeedHub 页面：$MOVIE_URL${*:+ 参数=$*}"
 docker exec \
     -e DISPLAY=:99 \
+    -e RESOURCE_SEEDHUB_ENTRY_RECHECK_HOURS="$ENTRY_RECHECK_HOURS" \
+    -e RESOURCE_SEEDHUB_ENTRY_RECHECK_MAX="$ENTRY_RECHECK_MAX" \
     "$CONTAINER" \
     python3 /work/seedhub_cache.py "$MOVIE_URL" "$@" >> "$LOG_FILE" 2>&1
