@@ -47,6 +47,26 @@ container_running() {
     [ "$state" = "true" ]
 }
 
+wait_xvfb_ready() {
+    local docker="$1"
+    local max_wait="${2:-20}"
+
+    for ((i=1; i<=max_wait; i++)); do
+        if ! container_running "$docker"; then
+            return 1
+        fi
+
+        if "$docker" exec "$CONTAINER" test -S /tmp/.X11-unix/X99 >/dev/null 2>&1; then
+            log "INFO SeedHub Xvfb :99 已就绪。"
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
 busy_reason() {
     local self_pid="$$"
     local proc pid raw cmd
@@ -135,8 +155,12 @@ case "$ACTION" in
         if [ -x "$START_SCRIPT" ] || [ -f "$START_SCRIPT" ]; then
             log "INFO 启动请求：复用 $START_SCRIPT"
             if /bin/bash "$START_SCRIPT" >> "$LOG_FILE" 2>&1; then
-                log "INFO SeedHub 容器启动流程完成。"
-                exit 0
+                if wait_xvfb_ready "$DOCKER" 20; then
+                    log "INFO SeedHub 容器启动流程完成。"
+                    exit 0
+                fi
+                log "ERROR SeedHub 容器已启动，但 Xvfb :99 未在 20s 内就绪。"
+                exit 1
             fi
             rc=$?
             log "ERROR SeedHub 容器启动失败：rc=$rc"
@@ -178,8 +202,12 @@ case "$ACTION" in
             if [ -f "$START_SCRIPT" ]; then
                 log "INFO 容器不存在，复用 $START_SCRIPT 创建并启动。"
                 if /bin/bash "$START_SCRIPT" >> "$LOG_FILE" 2>&1; then
-                    log "INFO SeedHub 容器创建/启动完成。"
-                    exit 0
+                    if wait_xvfb_ready "$DOCKER" 20; then
+                        log "INFO SeedHub 容器创建/启动完成。"
+                        exit 0
+                    fi
+                    log "ERROR SeedHub 容器已创建并运行，但 Xvfb :99 未在 20s 内就绪。"
+                    exit 1
                 fi
                 rc=$?
                 log "ERROR SeedHub 容器创建/启动失败：rc=$rc"
@@ -191,8 +219,12 @@ case "$ACTION" in
         if container_running "$DOCKER"; then
             log "INFO 重启 SeedHub 容器：$CONTAINER"
             if "$DOCKER" restart --time 15 "$CONTAINER" >> "$LOG_FILE" 2>&1; then
-                log "INFO SeedHub 容器重启完成。"
-                exit 0
+                if wait_xvfb_ready "$DOCKER" 20; then
+                    log "INFO SeedHub 容器重启完成。"
+                    exit 0
+                fi
+                log "ERROR SeedHub 容器重启成功，但 Xvfb :99 未在 20s 内就绪。"
+                exit 1
             fi
             rc=$?
             log "ERROR SeedHub 容器重启失败：rc=$rc"
@@ -200,8 +232,12 @@ case "$ACTION" in
         fi
         log "INFO 容器当前已停止，改为启动：$CONTAINER"
         if "$DOCKER" start "$CONTAINER" >> "$LOG_FILE" 2>&1; then
-            log "INFO SeedHub 已停止容器重新启动完成。"
-            exit 0
+            if wait_xvfb_ready "$DOCKER" 20; then
+                log "INFO SeedHub 已停止容器重新启动完成。"
+                exit 0
+            fi
+            log "ERROR SeedHub 已停止容器启动成功，但 Xvfb :99 未在 20s 内就绪。"
+            exit 1
         fi
         rc=$?
         log "ERROR 已停止容器启动失败：rc=$rc"
