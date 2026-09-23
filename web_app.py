@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Small, authenticated management UI layered on top of quark-follow scripts."""
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -24,6 +26,16 @@ API_STATS_PY = BASE / "docker" / "api_stats.py"
 LOCKS = {"resource_check": BASE / "resource_check.lock", "replace": BASE / "replace.lock"}
 WEB_RESTART_SCRIPT = BASE / "restart-web.sh"
 WEB_RESTART_LOCK = BASE / "web-restart.lock"
+SEEDHUB_CONTAINER = "seedhub-playwright"
+SEEDHUB_CONTAINER_SH = BASE / "seedhub_container.sh"
+SEEDHUB_CONTAINER_LOCK = BASE / "seedhub-container.lock"
+_CONTAINER_INSPECT_TTL = 2.0
+_CONTAINER_SYNC_TTL = 10.0
+_container_inspect_cache = None
+_container_inspect_cache_at = 0.0
+_container_sync_cache = None
+_container_sync_cache_at = 0.0
+_container_cache_lock = threading.Lock()
 USERNAME = os.environ.get("QUARK_WEB_USERNAME")
 PASSWORD = os.environ.get("QUARK_WEB_PASSWORD")
 if not USERNAME or not PASSWORD:
@@ -502,6 +514,494 @@ def latest_resource_run():
     return {"time": None, "result": "暂无完成记录"}
 
 
+def _invalidate_container_cache():
+    global _container_inspect_cache, _container_inspect_cache_at
+    global _container_sync_cache, _container_sync_cache_at
+    with _container_cache_lock:
+        _container_inspect_cache = None
+        _container_inspect_cache_at = 0.0
+        _container_sync_cache = None
+        _container_sync_cache_at = 0.0
+
+
+def _docker_bin():
+    return shutil.which("docker")
+
+
+def _docker_run(args, timeout=5):
+    docker = _docker_bin()
+    if not docker:
+        return None, "系统中找不到 docker 命令。"
+    try:
+        completed = subprocess.run(
+            [docker, *args],
+            cwd=BASE,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"docker 命令超过 {timeout}s 未返回。"
+    except OSError as exc:
+        return None, f"无法执行 docker：{exc}"
+    return completed, ""
+
+
+def _container_inspect(force=False):
+    global _container_inspect_cache, _container_inspect_cache_at
+    now = time.monotonic()
+    with _container_cache_lock:
+        if (
+            not force
+            and _container_inspect_cache is not None
+            and now - _container_inspect_cache_at < _CONTAINER_INSPECT_TTL
+        ):
+            return _container_inspect_cache
+
+    docker = _docker_bin()
+    if not docker:
+        result = {
+            "available": False,
+            "docker_available": False,
+            "exists": False,
+            "error": "系统中找不到 docker 命令。",
+            "raw": None,
+        }
+    else:
+        completed, error = _docker_run(
+            ["inspect", "--format", "{{json .}}", SEEDHUB_CONTAINER],
+            timeout=5,
+        )
+        if completed is None:
+            result = {
+                "available": False,
+                "docker_available": True,
+                "exists": False,
+                "error": error,
+                "raw": None,
+            }
+        elif completed.returncode != 0:
+            stderr = completed.stderr.strip() or "容器不存在。"
+            not_found = "No such object" in stderr or "No such container" in stderr or "没有这个容器" in stderr
+            result = {
+                "available": True,
+                "docker_available": True,
+                "exists": False,
+                "status": "not_found" if not_found else "inspect_error",
+                "error": stderr,
+                "raw": None,
+            }
+        else:
+            try:
+                raw = json.loads(completed.stdout)
+            except json.JSONDecodeError as exc:
+                result = {
+                    "available": True,
+                    "docker_available": True,
+                    "exists": True,
+                    "error": f"docker inspect 返回的数据无法解析：{exc}",
+                    "raw": None,
+                }
+            else:
+                state = raw.get("State") or {}
+                result = {
+                    "available": True,
+                    "docker_available": True,
+                    "exists": True,
+                    "error": "",
+                    "raw": raw,
+                    "container": {
+                        "id": raw.get("Id") or "",
+                        "name": (raw.get("Name") or "").lstrip("/") or SEEDHUB_CONTAINER,
+                        "image": raw.get("Config", {}).get("Image") or "",
+                        "created": raw.get("Created") or "",
+                        "status": state.get("Status") or "unknown",
+                        "running": bool(state.get("Running")),
+                        "restarting": bool(state.get("Restarting")),
+                        "paused": bool(state.get("Paused")),
+                        "dead": bool(state.get("Dead")),
+                        "started_at": state.get("StartedAt") or "",
+                        "finished_at": state.get("FinishedAt") or "",
+                        "exit_code": state.get("ExitCode"),
+                        "oom_killed": bool(state.get("OOMKilled")),
+                        "error": state.get("Error") or "",
+                        "restart_count": int(raw.get("RestartCount") or 0),
+                    },
+                    "mounts": [
+                        {
+                            "type": item.get("Type") or "",
+                            "source": item.get("Source") or "",
+                            "destination": item.get("Destination") or "",
+                            "rw": bool(item.get("RW")),
+                        }
+                        for item in (raw.get("Mounts") or [])
+                    ],
+                }
+
+    with _container_cache_lock:
+        _container_inspect_cache = result
+        _container_inspect_cache_at = time.monotonic()
+    return result
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _host_manifest(root):
+    manifest = {}
+    if not root.is_dir():
+        return manifest
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name != "__pycache__"]
+        for name in files:
+            if name.endswith(".pyc"):
+                continue
+            path = Path(current) / name
+            try:
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(root).as_posix()
+                manifest[rel] = {
+                    "size": path.stat().st_size,
+                    "sha256": _sha256_file(path),
+                }
+            except OSError:
+                continue
+    return manifest
+
+
+_CONTAINER_MANIFEST_PY = r"""
+import hashlib, json, os
+root = "/work"
+out = {}
+for current, dirs, files in os.walk(root):
+    dirs[:] = [name for name in dirs if name != "__pycache__"]
+    for name in files:
+        if name.endswith(".pyc"):
+            continue
+        path = os.path.join(current, name)
+        if not os.path.isfile(path):
+            continue
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        out[rel] = {"size": os.path.getsize(path), "sha256": digest.hexdigest()}
+print(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+"""
+
+
+def _container_manifest():
+    completed, error = _docker_run(
+        ["exec", SEEDHUB_CONTAINER, "python3", "-c", _CONTAINER_MANIFEST_PY],
+        timeout=10,
+    )
+    if completed is None:
+        return None, error
+    if completed.returncode != 0:
+        return None, completed.stderr.strip() or "无法读取容器 /work 文件。"
+    try:
+        return json.loads(completed.stdout), ""
+    except json.JSONDecodeError as exc:
+        return None, f"容器文件清单无法解析：{exc}"
+
+
+def _container_sync(inspect_data, force=False):
+    global _container_sync_cache, _container_sync_cache_at
+    now = time.monotonic()
+    with _container_cache_lock:
+        if (
+            not force
+            and _container_sync_cache is not None
+            and now - _container_sync_cache_at < _CONTAINER_SYNC_TTL
+        ):
+            return _container_sync_cache
+
+    host_root = BASE / "docker"
+    expected_mounts = {
+        "/work": host_root.resolve(),
+        "/data": BASE.resolve(),
+    }
+    mounts = {item["destination"]: item for item in inspect_data.get("mounts", [])}
+    mount_rows = []
+    mounts_ok = True
+    for destination, source in expected_mounts.items():
+        actual = mounts.get(destination)
+        actual_source = Path(actual["source"]).resolve() if actual and actual.get("source") else None
+        ok = bool(actual and actual.get("type") == "bind" and actual_source == source)
+        if not ok:
+            mounts_ok = False
+        mount_rows.append({
+            "destination": destination,
+            "expected_source": str(source),
+            "actual_source": str(actual_source) if actual_source else "",
+            "type": actual.get("type") if actual else "",
+            "rw": actual.get("rw") if actual else None,
+            "ok": ok,
+        })
+
+    host_manifest = _host_manifest(host_root)
+    container_manifest = None
+    manifest_error = ""
+    verified = False
+    comparison = []
+    if inspect_data.get("exists") and inspect_data.get("container", {}).get("running") and mounts_ok:
+        container_manifest, manifest_error = _container_manifest()
+        if container_manifest is not None:
+            verified = True
+            host_keys = set(host_manifest)
+            container_keys = set(container_manifest)
+            for rel in sorted(host_keys | container_keys):
+                host = host_manifest.get(rel)
+                container = container_manifest.get(rel)
+                if host is None:
+                    status = "container_only"
+                elif container is None:
+                    status = "host_only"
+                elif host == container:
+                    status = "same"
+                else:
+                    status = "different"
+                comparison.append({
+                    "path": rel,
+                    "host": host,
+                    "container": container,
+                    "status": status,
+                })
+    elif not mounts_ok:
+        manifest_error = "容器挂载关系与当前宿主路径不一致，禁止判定文件同步正常。"
+    elif not inspect_data.get("exists"):
+        manifest_error = "容器不存在，暂无法读取容器侧文件。"
+    else:
+        manifest_error = "容器未运行，无法执行容器侧文件清单；当前可校验挂载配置。"
+
+    if verified:
+        sync_status = "same" if all(item["status"] == "same" for item in comparison) else "different"
+        if not comparison:
+            sync_status = "same"
+        summary = {
+            "total": len(comparison),
+            "same": sum(1 for item in comparison if item["status"] == "same"),
+            "different": sum(1 for item in comparison if item["status"] == "different"),
+            "host_only": sum(1 for item in comparison if item["status"] == "host_only"),
+            "container_only": sum(1 for item in comparison if item["status"] == "container_only"),
+        }
+    elif mounts_ok and inspect_data.get("exists"):
+        sync_status = "mount_only"
+        summary = {
+            "total": len(host_manifest),
+            "same": 0,
+            "different": 0,
+            "host_only": 0,
+            "container_only": 0,
+        }
+    else:
+        sync_status = "unavailable"
+        summary = {
+            "total": len(host_manifest),
+            "same": 0,
+            "different": 0,
+            "host_only": 0,
+            "container_only": 0,
+        }
+
+    result = {
+        "method": "bind_mount",
+        "mounts_ok": mounts_ok,
+        "mounts": mount_rows,
+        "verified": verified,
+        "status": sync_status,
+        "summary": summary,
+        "files": comparison,
+        "error": manifest_error,
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with _container_cache_lock:
+        _container_sync_cache = result
+        _container_sync_cache_at = time.monotonic()
+    return result
+
+
+def _container_health(inspect_data):
+    if not inspect_data.get("exists"):
+        return {
+            "ready": False,
+            "script_exists": False,
+            "playwright": False,
+            "xvfb": False,
+            "mounts_ok": False,
+            "error": inspect_data.get("error") or "容器不存在。",
+        }
+    container = inspect_data.get("container") or {}
+    if not container.get("running"):
+        return {
+            "ready": False,
+            "script_exists": False,
+            "playwright": False,
+            "xvfb": False,
+            "mounts_ok": bool(_container_sync(inspect_data).get("mounts_ok")),
+            "error": "容器未运行。",
+        }
+
+    sync_data = _container_sync(inspect_data)
+    mounts_ok = bool(sync_data.get("mounts_ok"))
+    checks = {}
+    check_specs = {
+        "script_exists": ["exec", SEEDHUB_CONTAINER, "test", "-f", "/work/seedhub_cache.py"],
+        "playwright": [
+            "exec", SEEDHUB_CONTAINER, "python3", "-c",
+            "from playwright.sync_api import sync_playwright; import playwright; print('ok')",
+        ],
+        "xvfb": [
+            "exec", SEEDHUB_CONTAINER, "sh", "-c",
+            "test -S /tmp/.X11-unix/X99 && command -v Xvfb >/dev/null 2>&1",
+        ],
+    }
+    errors = []
+    for key, args in check_specs.items():
+        completed, error = _docker_run(args, timeout=5)
+        if completed is None:
+            checks[key] = False
+            errors.append(error)
+        else:
+            checks[key] = completed.returncode == 0
+            if completed.returncode != 0 and completed.stderr.strip():
+                errors.append(completed.stderr.strip())
+
+    ready = mounts_ok and all(checks.values())
+    return {
+        "ready": ready,
+        "script_exists": checks["script_exists"],
+        "playwright": checks["playwright"],
+        "xvfb": checks["xvfb"],
+        "mounts_ok": mounts_ok,
+        "error": "；".join(dict.fromkeys(errors)) if not ready and errors else ("挂载关系异常。" if not mounts_ok else ""),
+    }
+
+
+def container_data(force=False):
+    inspect_data = _container_inspect(force=force)
+    if not inspect_data.get("available") or not inspect_data.get("exists"):
+        available = bool(inspect_data.get("docker_available"))
+        status = inspect_data.get("status") or ("docker_unavailable" if not available else "not_found")
+        error = inspect_data.get("error", "Docker 状态读取失败。")
+        return {
+            "container": {
+                "exists": False,
+                "docker_available": available,
+                "name": SEEDHUB_CONTAINER,
+                "status": status,
+                "running": False,
+                "restarting": False,
+                "error": error,
+            },
+            "health": {
+                "ready": False,
+                "script_exists": False,
+                "playwright": False,
+                "xvfb": False,
+                "mounts_ok": False,
+                "error": error,
+            },
+            "sync": {
+                "method": "bind_mount",
+                "mounts_ok": False,
+                "verified": False,
+                "status": "unavailable",
+                "summary": {"total": 0, "same": 0, "different": 0, "host_only": 0, "container_only": 0},
+                "files": [],
+                "mounts": [],
+                "error": error,
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "parser": {"running": False, "pid": None, "target": ""},
+            "action_running": SEEDHUB_CONTAINER_LOCK.exists(),
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    sync_data = _container_sync(inspect_data)
+    health = _container_health(inspect_data)
+    container = inspect_data.get("container", {})
+    parser_task = task_status().get("seedhub_cache", {})
+    recent_parse = log_events(20, "PARSE")
+    return {
+        "container": {
+            **container,
+            "exists": True,
+            "docker_available": True,
+        },
+        "health": health,
+        "sync": sync_data,
+        "parser": {
+            "running": bool(parser_task.get("process_running")),
+            "pid": parser_task.get("pid"),
+            "target": parser_task.get("target") or "",
+        },
+        "action_running": SEEDHUB_CONTAINER_LOCK.exists(),
+        "recent_parse": recent_parse[0] if recent_parse else None,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def container_busy_reason():
+    state = task_status()
+    for key in ("resource_check", "seedhub_cache"):
+        if state.get(key, {}).get("running"):
+            return state[key].get("label") or key
+    return ""
+
+
+def start_container_action(action):
+    if action not in {"start", "stop", "restart"}:
+        abort(404)
+    if not SEEDHUB_CONTAINER_SH.is_file():
+        write_web_log("ERROR", f"SeedHub 容器操作脚本不存在：{SEEDHUB_CONTAINER_SH}")
+        return jsonify({"ok": False, "message": "seedhub_container.sh 不存在，未执行操作。"}), 500
+
+    with launch_lock:
+        if SEEDHUB_CONTAINER_LOCK.exists():
+            return jsonify({"ok": False, "message": "已有 SeedHub 容器操作正在执行，请等待完成。"}), 409
+
+        if action in {"stop", "restart"}:
+            busy = container_busy_reason()
+            if busy:
+                action_name = "停止" if action == "stop" else "重启"
+                write_web_log("WARN", f"SeedHub 容器 {action_name} 被拒绝：后台任务运行中：{busy}")
+                return jsonify({"ok": False, "message": f"当前有“{busy}”正在运行，为避免中断 SeedHub 解析，不能{action_name}容器。"}), 409
+
+        log = LOG_DIR / "seedhub_container_launcher.log"
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with log.open("ab") as output:
+                child = subprocess.Popen(
+                    ["/bin/bash", str(SEEDHUB_CONTAINER_SH), action],
+                    cwd=BASE,
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError as exc:
+            write_web_log("ERROR", f"SeedHub 容器操作启动失败：action={action} error={exc}")
+            return jsonify({"ok": False, "message": f"无法启动容器操作：{exc}"}), 500
+
+        _invalidate_container_cache()
+        write_web_log("INIT", f"SeedHub 容器操作已启动：action={action} pid={child.pid}")
+        return jsonify({"ok": True, "action": action, "pid": child.pid})
+
+
 def dashboard_data():
     task_state = task_status()
     shows = db_query("SELECT COUNT(*) AS n FROM shows", one=True) or {"n": 0}
@@ -545,7 +1045,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body data-page='{{ page_name|default("") }}'><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;if(document.body.dataset.page==='dashboard')return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body data-page='{{ page_name|default("") }}'><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/container'>容器</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;if(document.body.dataset.page==='dashboard')return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -1180,6 +1680,105 @@ def api_stats_page():
 @login_required
 def api_stats():
     return jsonify(api_stats_data())
+
+
+@app.route('/container')
+@login_required
+def container_page():
+    return render_template_string(
+        BASE_TEMPLATE + r"""<h1>SeedHub 解析容器</h1>
+        <div id='container-state'></div>
+        <p class='muted'>页面自动刷新；容器操作只允许固定的启动、停止、重启，不提供任意 Docker 命令。停止/重启会在 resource_check 或 SeedHub 解析运行时自动拒绝。</p>
+        <script>
+        const esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
+        const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+        let actionBusy=false;
+        function statusText(c){
+          if(!c?.docker_available)return 'Docker 不可用';
+          if(!c?.exists)return '不存在';
+          if(c.restarting||c.status==='restarting')return '重启中';
+          if(c.running)return '运行中';
+          return '已停止';
+        }
+        function statusClass(c){return !c?.docker_available||!c?.exists?'bad':(c.restarting||c.status==='restarting')?'warn':c.running?'ok':'bad';}
+        function syncText(s){return s.status==='same'?'文件一致':s.status==='different'?'存在差异':s.status==='mount_only'?'Bind Mount 已确认':'暂不可验证';}
+        function syncClass(s){return s.status==='same'||s.status==='mount_only'?'ok':s.status==='different'?'bad':'warn';}
+        function fmtSize(n){n=Number(n||0);if(n<1024)return n+' B';if(n<1024*1024)return (n/1024).toFixed(1)+' KB';if(n<1024*1024*1024)return (n/1024/1024).toFixed(1)+' MB';return (n/1024/1024/1024).toFixed(2)+' GB';}
+        async function doAction(action){
+          if(actionBusy)return;
+          let d=window.currentContainerData||{};
+          if((action==='stop'||action==='restart') && d.parser?.running){alert('当前正在执行 SeedHub 解析，不能停止或重启容器。请等待解析结束。');return;}
+          if(action==='stop' && d.container?.exists && !d.container.running)return;
+          const messages={start:'确定启动 SeedHub 解析容器吗？',stop:'确定停止 SeedHub 解析容器吗？\n\n如果 resource_check 或 SeedHub 解析正在运行，后端会拒绝此操作。',restart:'确定重启 SeedHub 解析容器吗？\n\n如果 resource_check 或 SeedHub 解析正在运行，后端会拒绝此操作。'};
+          if(!confirm(messages[action]))return;
+          actionBusy=true;
+          try{
+            const r=await fetch('/tasks/container/'+action,{method:'POST',headers:{'Content-Type':'application/json'}});
+            const body=await r.json().catch(()=>({}));
+            if(!r.ok){alert(body.message||('容器操作请求失败。'));actionBusy=false;return;}
+          }catch(e){alert('容器操作请求失败：'+(e.message||e));actionBusy=false;return;}
+          for(let i=0;i<25;i++){
+            await sleep(800);
+            try{
+              const r=await fetch('/api/container?ts='+Date.now(),{cache:'no-store'});
+              if(r.ok){window.currentContainerData=await r.json();render(window.currentContainerData);if(!window.currentContainerData.action_running)break;}
+            }catch(e){}
+          }
+          actionBusy=false;
+          load();
+        }
+        function render(d){
+          window.currentContainerData=d;
+          const c=d.container||{};const h=d.health||{};const s=d.sync||{};const parser=d.parser||{};const root=document.querySelector('#container-state');
+          const actionRunning=d.action_running;
+          const canStop=c.exists&&c.running&&!actionRunning&&!parser.running;
+          const canStart=(!c.exists||!c.running)&&!actionRunning;
+          const canRestart=c.exists&&!actionRunning&&!parser.running;
+          const files=(s.files||[]).map(x=>{
+            const hs=x.host?.sha256?x.host.sha256.slice(0,12):'—';const cs=x.container?.sha256?x.container.sha256.slice(0,12):'—';
+            const state=x.status==='same'?'一致':x.status==='different'?'差异':x.status==='host_only'?'宿主独有':'容器独有';
+            return `<tr><td><code>${esc(x.path)}</code></td><td>${esc(fmtSize(x.host?.size))}<br><span class=muted>${hs}</span></td><td>${esc(fmtSize(x.container?.size))}<br><span class=muted>${cs}</span></td><td class=${x.status==='same'?'ok':'bad'}>${state}</td></tr>`;
+          }).join('');
+          const mounts=(s.mounts||[]).map(x=>`<tr><td><code>${esc(x.destination)}</code></td><td><code>${esc(x.actual_source||x.expected_source)}</code></td><td>${x.type==='bind'?'Bind Mount':esc(x.type||'异常')}</td><td>${x.rw===true?'读写':x.rw===false?'只读':'—'}</td><td class=${x.ok?'ok':'bad'}>${x.ok?'正常':'异常'}</td></tr>`).join('');
+          root.innerHTML=`
+          <div class=grid>
+            <div class=card><div class=label>容器状态</div><div class="metric ${statusClass(c)}">${esc(statusText(c))}</div><div class=label>${esc(c.name||'seedhub-playwright')} · ${esc(c.image||'未知镜像')}</div><div class=actions style="margin-top:12px"><button onclick="doAction('start')" ${canStart?'':'disabled'}>启动</button><button class=secondary onclick="doAction('restart')" ${canRestart?'':'disabled'}>重启</button><button class=danger onclick="doAction('stop')" ${canStop?'':'disabled'}>停止</button></div>${actionRunning?'<p class=warn>容器操作正在执行…</p>':''}</div>
+            <div class=card><div class=label>解析环境</div><div class="metric ${h.ready?'ok':'warn'}">${h.ready?'就绪':'异常/未就绪'}</div><div>seedhub_cache.py：${h.script_exists?'<span class=ok>✓</span>':'<span class=bad>✗</span>'} · Playwright：${h.playwright?'<span class=ok>✓</span>':'<span class=bad>✗</span>'} · Xvfb：${h.xvfb?'<span class=ok>✓</span>':'<span class=bad>✗</span>'}</div><div class=muted>${esc(h.error||'')}</div></div>
+            <div class=card><div class=label>当前 SeedHub 任务</div><div class="metric ${parser.running?'warn':'ok'}">${parser.running?'解析中':'空闲'}</div><div class=label>${parser.pid?'PID '+esc(parser.pid):'无进程'}${parser.target?' · '+esc(parser.target):''}</div><div class=actions style="margin-top:12px"><a class='button secondary' href='/logs?category=PARSE'>查看解析日志</a></div></div>
+          </div>
+          <div class=card><div class=label>宿主机 / 容器文件状态</div><div class="metric ${syncClass(s)}">${esc(syncText(s))}</div><p>同步机制：<b>Bind Mount</b> · <code>/docker → /work</code>、<code>项目目录 → /data</code>。实际宿主路径以部署位置为准。</p><p>${esc(s.error||'')}</p><div class=muted>已验证 ${s.summary?.same||0} / ${s.summary?.total||0} 个文件${s.verified?' · SHA256 已实际比对':' · 当前为挂载关系校验，容器侧清单暂不可用'}</div><div class=tablewrap style="margin-top:12px"><table><tr><th>文件</th><th>宿主机</th><th>容器</th><th>状态</th></tr>${files||'<tr><td colspan=4>当前无法取得容器侧文件清单；请先启动容器。</td></tr>'}</table></div></div>
+          <div class=card><div class=label>挂载检查</div><div class="metric ${s.mounts_ok?'ok':'bad'}">${s.mounts_ok?'正常':'异常'}</div><div class=tablewrap><table><tr><th>容器路径</th><th>宿主来源</th><th>类型</th><th>权限</th><th>状态</th></tr>${mounts||'<tr><td colspan=5>暂无挂载信息。</td></tr>'}</table></div></div>
+          <div class=card><div class=label>容器诊断</div><div class=tablewrap><table><tr><th>项目</th><th>值</th><th>项目</th><th>值</th></tr><tr><td>Container ID</td><td><code>${esc((c.id||'').slice(0,16)||'—')}</code></td><td>Restart Count</td><td>${c.restart_count??'—'}</td></tr><tr><td>Created</td><td>${esc(c.created||'—')}</td><td>Started</td><td>${esc(c.started_at||'—')}</td></tr><tr><td>Exit Code</td><td>${c.exit_code??'—'}</td><td>OOMKilled</td><td class=${c.oom_killed?'bad':'ok'}>${c.oom_killed?'是':'否'}</td></tr><tr><td>Last Error</td><td colspan=3 class=${c.error?'bad':''}>${esc(c.error||'无')}</td></tr></table></div></div>
+          <div class=card><div class=label>最近一次 SeedHub 日志</div>${d.recent_parse?`<span class=tag>PARSE</span> <span class=muted>${esc(d.recent_parse.time)} · ${esc(d.recent_parse.source)}</span><pre class=log>${esc(d.recent_parse.message)}</pre>`:'暂无解析日志'}</div>`;
+        }
+        async function load(){if(actionBusy)return;try{const r=await fetch('/api/container?ts='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);render(await r.json());}catch(e){document.querySelector('#container-state').innerHTML=`<div class=card><h2>容器状态读取失败</h2><p class=bad>${esc(e.message||e)}</p></div>`;}}
+        load();setInterval(load,3000);
+        </script></main>""",
+    )
+
+
+@app.route('/api/container')
+@login_required
+def api_container():
+    return jsonify(container_data())
+
+
+@app.post('/tasks/container/start')
+@login_required
+def start_container():
+    return start_container_action('start')
+
+
+@app.post('/tasks/container/stop')
+@login_required
+def stop_container():
+    return start_container_action('stop')
+
+
+@app.post('/tasks/container/restart')
+@login_required
+def restart_container():
+    return start_container_action('restart')
 
 
 @app.route('/logs')
