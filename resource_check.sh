@@ -1203,8 +1203,10 @@ prune_overflow_shares() {
     : > "$output"
 
     # 只删除同时满足：没有唯一集、没有前20之外独占集、没有明显优于前20文件。
+    # PRAGMA busy_timeout 会返回当前超时值；不能让它混入下面 SELECT 的结果文件，
+    # 否则这个值会被误当成 Share ID。
+    sqlite3 "$DB" "$SQL_BUSY_TIMEOUT" >/dev/null 2>&1
     sqlite3 "$DB" <<SQL > "$output"
-$SQL_BUSY_TIMEOUT
 WITH unique_episode_shares AS (
     SELECT sf.share_id, sf.episode
       FROM share_files sf JOIN shares s ON s.id=sf.share_id
