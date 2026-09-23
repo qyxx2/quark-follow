@@ -318,7 +318,7 @@ def seasonize_show_name(show_name, season):
         -> 绅士们第二季
 
     如果中文标题本身没有季度标记，则在中文标题后补“第N季”。
-    纯英文标题则去掉英文 Season/SN 标记后补“第N季”。
+    纯英文标题则去掉英文 Season/SN 季数标记后补“第N季”。
     """
     text = normalize_text(show_name)
 
@@ -400,7 +400,6 @@ def get_show_name(page):
 
             if lines:
                 h1_candidates.append(lines[0])
-
     except Exception:
         pass
 
@@ -444,8 +443,8 @@ def detect_total_episodes(page):
         body_text = normalize_text(body_text)
 
         patterns = [
-            r'集\s*数\s*[:：]\s*(\d+)',
-            r'集数\s*[:：]\s*(\d+)',
+            r'集\s*数\s*[:：](\d+)',
+            r'集数\s*[:：](\d+)',
         ]
 
         for pattern in patterns:
@@ -546,6 +545,19 @@ def replace_webdav_leaf(path, name):
 def get_pwd_id(quark_url):
     match = re.search(r"https?://pan\.quark\.cn/s/([^/#?]+)", quark_url or "", re.I)
     return match.group(1) if match else ""
+
+
+def is_blacklisted(conn, show_id, quark_url):
+    pwd_id = get_pwd_id(quark_url)
+    if not pwd_id:
+        return False
+
+    row = conn.execute(
+        "SELECT 1 FROM share_blacklist WHERE show_id=? AND pwd_id=? LIMIT 1",
+        (show_id, pwd_id),
+    ).fetchone()
+
+    return row is not None
 
 
 def ensure_column(conn, table, column, definition):
@@ -821,6 +833,8 @@ def refresh_existing_front20_entry(
 
     if is_blacklisted(conn, show_id, quark_url):
         print("     新 Quark 位于黑名单，保留原 Share，不覆盖旧缓存：", quark_url)
+        conn.commit()
+        return True
         conn.commit()
         return True
 
