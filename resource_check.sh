@@ -694,18 +694,40 @@ for n in r.iter():
   if not name: continue
   rt_any=any(ln(x.tag)=="collection" for x in n.iter())
   if rt_any: continue
-  z=next(((x.text or "").strip() for x in n.iter() if ln(x.tag)=="getcontentlength"),"0") or "0"
-  if not z.isdigit(): z="0"
+  z=next(((x.text or "").strip() for x in n.iter() if ln(x.tag)=="getcontentlength"),"")
+  if not z.isdigit(): raise SystemExit("invalid getcontentlength for: "+name)
   mt=next(((x.text or "").strip() for x in n.iter() if ln(x.tag)=="getlastmodified"),"")
-  print(name+"\\t"+z+"\\t"+mt)' "$target" "$xml" > "$raw"; then
+  print(name,z,mt,sep="\t")' "$target" "$xml" > "$raw"; then
         error "解析 WebDAV PROPFIND XML 失败：$target"
         rm -f "$xml" "$raw"
         return 1
     fi
 
+    local raw_name raw_size raw_mtime raw_extra
     local name size mtime key
-    while IFS=$'\t' read -r name size mtime; do
-        [ -n "$name" ] || continue
+    while IFS=$'\t' read -r raw_name raw_size raw_mtime raw_extra; do
+        # scan_webdav_actual 的 Python 输出必须严格是 3 列：
+        #   filename<TAB>size<TAB>mtime
+        # 任何字段错位都直接中止，绝不把损坏数据写入 webdav_files。
+        if [ -n "${raw_extra:-}" ]; then
+            error "WebDAV 扫描结果字段数量异常：文件名可能包含非法 TAB：$(printf '%s' "$raw_name" | cut -c1-120)"
+            rm -f "$xml" "$raw"
+            return 1
+        fi
+        if [ -z "${raw_name:-}" ]; then
+            error "WebDAV 扫描结果缺少文件名"
+            rm -f "$xml" "$raw"
+            return 1
+        fi
+        if ! [[ "${raw_size:-}" =~ ^[0-9]+$ ]]; then
+            error "WebDAV 扫描结果文件大小异常：name=$(printf '%s' "$raw_name" | cut -c1-120) size=${raw_size:-<empty>}"
+            rm -f "$xml" "$raw"
+            return 1
+        fi
+
+        name="$raw_name"
+        size="$raw_size"
+        mtime="${raw_mtime:-}"
         key="$(parse_episode "$name" "$target" 2>/dev/null || true)"
         [ -n "$key" ] || continue
 
@@ -713,7 +735,6 @@ for n in r.iter():
         # 当前季度隔离只在 get_max_known_episode/get_missing_file/candidate
         # 等计算阶段完成，不能在这里把其它季度从 webdav_files 中删掉。
         [[ "$key" =~ ^S[0-9]{2}E[0-9]{2}$ ]] || continue
-        [[ "$size" =~ ^[0-9]+$ ]] || size=0
         printf '%s\t%s\t%s\t%s\n' "$key" "$name" "$size" "$mtime" >> "$output"
     done < "$raw"
 
@@ -1271,6 +1292,14 @@ refresh_replacement_sources() {
     done < "$output"
 }
 
+webdav_name_is_invalid() {
+    local value="$1"
+    case "$value" in
+        *$'\t'*|*'\t'*) return 0 ;;
+    esac
+    return 1
+}
+
 queue_replacements() {
     local show_id="$1" show_name="$2"
     local all_file="$3" best_file="$TMP_ROOT/repl-best-${show_id}.tsv"
@@ -1293,6 +1322,18 @@ queue_replacements() {
         old_file="${WEBDAV_NAME[$episode]}"
         old_size="${WEBDAV_SIZE[$episode]:-0}"
         [[ "$old_size" =~ ^[0-9]+$ ]] || old_size=0
+
+        # WebDAV 元数据不完整时，禁止进入 replace_queue。
+        # 正常视频的文件大小必须大于 0，文件名也不能带 TAB 或本次已知的
+        # 字面量 "\t" 污染，否则 replace.sh 只能得到不可信的旧文件信息。
+        if [ "$old_size" -le 0 ]; then
+            error "[$show_name] 替换候选元数据异常，跳过入队：$episode old_file=$old_file old_size=$old_size"
+            continue
+        fi
+        if webdav_name_is_invalid "$old_file"; then
+            error "[$show_name] 替换候选文件名异常，跳过入队：$episode old_file=$old_file"
+            continue
+        fi
 
         # 如果已知当前文件正来自同一 Share，则不重复排队。
         local current_source
