@@ -61,6 +61,7 @@ def main():
         show_id INTEGER NOT NULL,
         url TEXT NOT NULL,
         seedhub_entry_url TEXT,
+        seedhub_entry_checked_at TEXT,
         seedhub_rank INTEGER,
         status TEXT NOT NULL DEFAULT 'unknown',
         pool_type TEXT NOT NULL DEFAULT 'front20',
@@ -108,10 +109,6 @@ def main():
         FOREIGN KEY (show_id)
             REFERENCES shows(id)
             ON DELETE CASCADE,
-
-        FOREIGN KEY (source_share_id)
-            REFERENCES shares(id)
-            ON DELETE SET NULL,
 
         UNIQUE(show_id, episode, filename)
     );
@@ -182,6 +179,7 @@ def main():
     add_column_if_missing(conn, "shows", "discovery_fail_rank", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "shows", "discovery_fail_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "shares", "seedhub_entry_url", "TEXT")
+    add_column_if_missing(conn, "shares", "seedhub_entry_checked_at", "TEXT")
     new_pool_type = add_column_if_missing(conn, "shares", "pool_type", "TEXT NOT NULL DEFAULT 'front20'")
     add_column_if_missing(conn, "shares", "pending_probe_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "shares", "used_count", "INTEGER NOT NULL DEFAULT 0")
@@ -189,6 +187,7 @@ def main():
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_pool_rank ON shares(show_id, pool_type, seedhub_rank)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_entry ON shares(show_id, seedhub_entry_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_entry_checked ON shares(show_id, seedhub_entry_checked_at)")
 
     if new_pool_type:
         conn.execute("""

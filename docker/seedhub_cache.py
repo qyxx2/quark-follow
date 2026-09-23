@@ -6,7 +6,7 @@ import re
 import sys
 import time
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import builtins
 from urllib.parse import urljoin
@@ -36,6 +36,33 @@ API_STATS_FILE = LOG_FILE.parent / f"api_stats_live_seedhub_{os.getpid()}.tsv"
 FRONT_SHARE_LIMIT = 20
 PAGE_TIMEOUT = 60000
 PAGE_DELAY = 2
+
+# 已有二级入口低频重新确认：
+# - 每个入口默认至少 72 小时才重新打开一次；
+# - 每次运行最多确认 2 个已有入口；
+# - 新进入前20的二级入口仍按原逻辑立即打开，不受此限制。
+DEFAULT_ENTRY_RECHECK_HOURS = 72
+DEFAULT_ENTRY_RECHECK_MAX = 2
+
+
+def env_nonnegative_int(name, default):
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print(f"配置 {name}={raw!r} 无效，使用默认值 {default}")
+        return default
+    return max(0, value)
+
+
+ENTRY_RECHECK_HOURS = env_nonnegative_int(
+    "RESOURCE_SEEDHUB_ENTRY_RECHECK_HOURS",
+    DEFAULT_ENTRY_RECHECK_HOURS,
+)
+ENTRY_RECHECK_MAX = env_nonnegative_int(
+    "RESOURCE_SEEDHUB_ENTRY_RECHECK_MAX",
+    DEFAULT_ENTRY_RECHECK_MAX,
+)
 
 CN_DIGITS = {
     "零": 0,
@@ -551,6 +578,7 @@ def ensure_schema(conn):
     ensure_column(conn, "shows", "discovery_fail_count", "INTEGER NOT NULL DEFAULT 0")
     new_pool_type = ensure_column(conn, "shares", "pool_type", "TEXT NOT NULL DEFAULT 'front20'")
     ensure_column(conn, "shares", "seedhub_entry_url", "TEXT")
+    ensure_column(conn, "shares", "seedhub_entry_checked_at", "TEXT")
     ensure_column(conn, "shares", "pending_probe_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "shares", "used_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "shares", "last_used_at", "TEXT")
@@ -569,6 +597,7 @@ def ensure_schema(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_share_blacklist_show_pwd ON share_blacklist(show_id,pwd_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_pool_rank ON shares(show_id,pool_type,seedhub_rank)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_entry ON shares(show_id,seedhub_entry_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shares_show_entry_checked ON shares(show_id,seedhub_entry_checked_at)")
 
     # 旧版本可能把“成功但没有任何 share_files”的 Share 留成 valid。
     # 它们已经至少经历过一次成功扫描，因此从 pending_probe_count=1 开始。
@@ -709,27 +738,226 @@ def save_share(
 # SeedHub 前20固定资源池 / 受控额外探索
 # ============================================================
 
-def is_blacklisted(conn, show_id, quark_url):
-    pwd_id = get_pwd_id(quark_url)
-    if not pwd_id:
+def checked_at_is_due(value):
+    if not value:
+        return True
+
+    try:
+        checked_at = datetime.strptime(
+            value,
+            "%Y-%m-%d %H:%M:%S",
+        ).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
+    elapsed = (
+        datetime.now(timezone.utc) - checked_at
+    ).total_seconds()
+
+    return elapsed >= ENTRY_RECHECK_HOURS * 3600
+
+
+def mark_entry_checked(conn, share_id):
+    conn.execute(
+        "UPDATE shares SET seedhub_entry_checked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (share_id,),
+    )
+
+
+def refresh_existing_front20_entry(
+    conn,
+    page,
+    show_id,
+    item,
+    existing
+):
+    """
+    低频重新确认已有二级入口。
+
+    这里故意不改变原有 Share 生命周期：
+    - 只在二级页成功访问后更新时间；
+    - 页面暂时没有 Quark 时保留旧 Share，避免一次异常把旧资源删除；
+    - 如果 Quark URL 真正变化，则把新 URL 写入 shares；
+    - 原有 Share 不直接删除，让 resource_check/source_check 的现有缓存和替换逻辑继续工作。
+    """
+    entry_url = item["url"]
+    old_share_id = existing["id"]
+    old_quark_url = existing.get("url") or ""
+
+    print()
+    print(
+        "[%02d] 低频确认已有二级入口：%s"
+        % (item["rank"], item["title"][:100])
+    )
+    print("     二级:", entry_url)
+    print(
+        "     上次确认:",
+        existing.get("seedhub_entry_checked_at") or "从未确认"
+    )
+
+    try:
+        quark_url = open_entry_and_extract(page, item)
+    except Exception as exc:
+        print("     二级入口重新确认失败:", exc)
         return False
-    row = conn.execute(
-        "SELECT 1 FROM share_blacklist WHERE show_id=? AND pwd_id=? LIMIT 1",
-        (show_id, pwd_id),
+
+    # 页面已经成功打开。即使暂时没抓到 Quark，也记录确认时间，
+    # 防止异常页面连续触发 Playwright 请求。
+    mark_entry_checked(conn, old_share_id)
+
+    if not quark_url:
+        print("     本次未找到 Quark，保留原 Share：", old_quark_url or "<empty>")
+        conn.commit()
+        return True
+
+    if old_quark_url == quark_url:
+        print("     Quark 未变化：", quark_url)
+        conn.commit()
+        return True
+
+    print("     检测到 Quark URL 变化：")
+    print("       旧:", old_quark_url or "<empty>")
+    print("       新:", quark_url)
+
+    if is_blacklisted(conn, show_id, quark_url):
+        print("     新 Quark 位于黑名单，保留原 Share，不覆盖旧缓存：", quark_url)
+        conn.commit()
+        return True
+
+    before = conn.execute(
+        """
+        SELECT id, seedhub_entry_url, seedhub_rank
+        FROM shares
+        WHERE show_id=? AND url=?
+        LIMIT 1
+        """,
+        (show_id, quark_url),
     ).fetchone()
-    return row is not None
+
+    if before is None:
+        save_share(
+            conn,
+            show_id,
+            quark_url,
+            item["rank"],
+            entry_url,
+            "front20",
+        )
+        after = conn.execute(
+            "SELECT id FROM shares WHERE show_id=? AND url=? LIMIT 1",
+            (show_id, quark_url),
+        ).fetchone()
+        new_share_id = after[0] if after else None
+    else:
+        new_share_id = before[0]
+        save_share(
+            conn,
+            show_id,
+            quark_url,
+            item["rank"],
+            entry_url,
+            "front20",
+        )
+
+    if new_share_id:
+        # 新 Share 如果本来就是该入口对应的 Share，则只需刷新确认时间。
+        # 如果新 URL 已存在于其它入口，则沿用原有“较早 rank 优先”规则；
+        # 只有当前入口的 rank 不低于旧映射时，才接管该映射。
+        new_row = conn.execute(
+            """
+            SELECT id,seedhub_entry_url,seedhub_rank
+            FROM shares
+            WHERE id=?
+            LIMIT 1
+            """,
+            (new_share_id,),
+        ).fetchone()
+
+        can_claim = bool(
+            new_row
+            and (
+                new_row[1] == entry_url
+                or not new_row[1]
+                or (
+                    new_row[2] is not None
+                    and int(new_row[2]) >= int(item["rank"])
+                )
+            )
+        )
+
+        if can_claim:
+            previous_entry = new_row[1] if new_row else None
+            if new_share_id != old_share_id and previous_entry and previous_entry != entry_url:
+                # 新 URL 原先属于另一个入口；把那个入口释放出来，
+                # 后续完整前20同步仍会按当前一级页面重新确认其映射。
+                conn.execute(
+                    """
+                    UPDATE shares
+                       SET seedhub_entry_url=NULL,
+                           pool_type='overflow',
+                           updated_at=CURRENT_TIMESTAMP
+                     WHERE id=?
+                    """,
+                    (new_share_id,),
+                )
+
+            conn.execute(
+                """
+                UPDATE shares
+                   SET seedhub_entry_url=?,
+                       seedhub_rank=?,
+                       pool_type='front20',
+                       seedhub_entry_checked_at=CURRENT_TIMESTAMP,
+                       updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?
+                """,
+                (entry_url, item["rank"], new_share_id),
+            )
+
+            if new_share_id != old_share_id:
+                # 旧 Quark URL 保留及其 share_files 均不删除，只解除当前二级入口映射。
+                conn.execute(
+                    """
+                    UPDATE shares
+                       SET seedhub_entry_url=NULL,
+                           pool_type='overflow',
+                           updated_at=CURRENT_TIMESTAMP
+                     WHERE id=?
+                    """,
+                    (old_share_id,),
+                )
+
+            print("     已将当前二级入口映射到新 Share：share_id=", new_share_id)
+        else:
+            # 新 URL 已由更高优先级入口占用：不抢占已有映射，也不删除旧 Share。
+            print(
+                "     新 Share 已存在且保留更高优先级入口映射，保留旧入口映射：share_id=",
+                new_share_id,
+            )
+
+    # 旧 Share 不删除、不清理 share_files；只有在新 URL 成功接管当前入口时才解除映射。
+    conn.commit()
+    return True
 
 
 def open_entry_and_extract(page, item):
     print()
     print("[%02d] %s" % (item["rank"], item["title"][:100]))
     print("     二级:", item["url"])
-    page.goto(
-        item["url"],
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT
-    )
-    html = page.content()
+
+    try:
+        page.goto(
+            item["url"],
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT
+        )
+        html = page.content()
+    except Exception:
+        api_stats_record("share_page", failed=True)
+        raise
+    else:
+        api_stats_record("share_page", failed=False)
+
     quark_url = extract_quark_url(html)
     if quark_url:
         print("     Quark:", quark_url)
@@ -743,23 +971,47 @@ def reconcile_front20(conn, page, show_id):
     current_entries = {item["url"] for item in items}
     existing_by_entry = {}
     for row in conn.execute(
-        "SELECT id,seedhub_entry_url FROM shares WHERE show_id=? AND seedhub_entry_url IS NOT NULL",
+        """
+        SELECT id,seedhub_entry_url,url,seedhub_entry_checked_at,seedhub_rank
+        FROM shares
+        WHERE show_id=? AND seedhub_entry_url IS NOT NULL
+        ORDER BY COALESCE(seedhub_rank,999999),id
+        """,
         (show_id,),
     ).fetchall():
-        existing_by_entry[row[1]] = row[0]
+        entry_url = row[1]
+        if entry_url in existing_by_entry:
+            continue
+        existing_by_entry[entry_url] = {
+            "id": row[0],
+            "seedhub_entry_url": row[1],
+            "url": row[2],
+            "seedhub_entry_checked_at": row[3],
+            "seedhub_rank": row[4],
+        }
 
     fetched = 0
     added = 0
     failed = 0
+    existing_recheck_due = []
 
     for item in items:
         entry_url = item["url"]
-        existing_id = existing_by_entry.get(entry_url)
-        if existing_id is not None:
+        existing = existing_by_entry.get(entry_url)
+
+        if existing is not None:
             conn.execute(
                 "UPDATE shares SET seedhub_rank=?, pool_type='front20', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (item["rank"], existing_id),
+                (item["rank"], existing["id"]),
             )
+
+            # 注意：这里不重新打开二级页。
+            # 只有进入低频确认冷却窗口的已有入口才加入本轮确认队列。
+            if (
+                ENTRY_RECHECK_MAX > 0
+                and checked_at_is_due(existing.get("seedhub_entry_checked_at"))
+            ):
+                existing_recheck_due.append((item, existing))
             continue
 
         try:
@@ -804,7 +1056,17 @@ def reconcile_front20(conn, page, show_id):
                     "UPDATE shares SET pool_type='front20',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (share_id,),
                 )
-        existing_by_entry[entry_url] = share_id
+        conn.execute(
+            "UPDATE shares SET seedhub_entry_checked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (share_id,),
+        )
+        existing_by_entry[entry_url] = {
+            "id": share_id,
+            "seedhub_entry_url": entry_url,
+            "url": quark_url,
+            "seedhub_entry_checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "seedhub_rank": item["rank"],
+        }
 
         if item is not items[-1]:
             time.sleep(PAGE_DELAY)
@@ -813,6 +1075,37 @@ def reconcile_front20(conn, page, show_id):
     # 如果页面标记的总入口数量大于本次实际解析出的入口数量，说明本次结果可能不完整；
     # 此时保留旧 front20，避免一次临时解析异常误删/降级正常资源。
     complete_front20 = total_links > 0 and len(items) == min(total_links, FRONT_SHARE_LIMIT)
+
+    # 本轮只确认少量已有二级入口。
+    # 按前20 rank 顺序处理，保证行为稳定；每个入口仍遵守自己的冷却时间。
+    checked_existing = 0
+    if ENTRY_RECHECK_MAX > 0 and existing_recheck_due:
+        print()
+        print(
+            "开始低频确认已有二级入口：",
+            f"候选={len(existing_recheck_due)}",
+            f"本轮上限={ENTRY_RECHECK_MAX}",
+            f"冷却={ENTRY_RECHECK_HOURS}小时",
+        )
+
+        for item, existing in existing_recheck_due:
+            if checked_existing >= ENTRY_RECHECK_MAX:
+                break
+
+            if refresh_existing_front20_entry(
+                conn,
+                page,
+                show_id,
+                item,
+                existing,
+            ):
+                checked_existing += 1
+
+            if checked_existing < min(
+                ENTRY_RECHECK_MAX,
+                len(existing_recheck_due)
+            ):
+                time.sleep(PAGE_DELAY)
 
     if complete_front20 and current_entries:
         placeholders = ",".join("?" for _ in current_entries)
@@ -831,6 +1124,8 @@ def reconcile_front20(conn, page, show_id):
     else:
         print("一级页面入口解析不完整，保留现有 front20 资源池，不执行旧 Share 降级。")
 
+    # 原来的前20同步只更新 rank/cursor；
+    # 这里额外保留低频确认的统计信息，不改变其原有字段语义。
     conn.execute(
         "UPDATE shows SET share_scan_rank=?, discovery_cursor=CASE WHEN COALESCE(discovery_cursor,0)<? THEN ? ELSE discovery_cursor END, last_scan=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
         (min(total_links, FRONT_SHARE_LIMIT), FRONT_SHARE_LIMIT, FRONT_SHARE_LIMIT, show_id),
@@ -843,6 +1138,8 @@ def reconcile_front20(conn, page, show_id):
     print("  当前前20入口:", len(items))
     print("  新解析二级入口:", fetched)
     print("  新增/复用 Share:", added, "/", len(items))
+    print("  已确认旧二级入口:", checked_existing)
+    print("  待低频确认旧入口:", max(0, len(existing_recheck_due) - checked_existing))
     print("  二级入口失败:", failed)
     print("  share_scan_rank:", min(total_links, FRONT_SHARE_LIMIT))
 
@@ -900,6 +1197,7 @@ def scan_seedhub_range(conn, page, show_id, start_rank, count):
     conn.commit()
     print(f"受控探索完成：rank={start_rank}-{start_rank+processed-1} cursor={current_cursor}")
     return 0
+
 
 # ============================================================
 # 主程序
