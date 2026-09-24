@@ -285,6 +285,12 @@ ensure_runtime_schema() {
 
     sqlite3 "$DB" <<'SQL' >/dev/null
 PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS manual_shares (
+    share_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (share_id) REFERENCES shares(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_manual_shares_share_id ON manual_shares(share_id);
 CREATE TABLE IF NOT EXISTS share_blacklist (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     show_id INTEGER NOT NULL,
@@ -1253,6 +1259,9 @@ SELECT s.id
 FROM shares s
 WHERE s.show_id=$(sql_quote "$show_id")
   AND s.pool_type='overflow'
+  AND NOT EXISTS (
+      SELECT 1 FROM manual_shares m WHERE m.share_id=s.id
+  )
   AND (
        (s.status='unknown' AND COALESCE(s.fail_count,0)=0 AND COALESCE(s.used_count,0)=0)
        OR

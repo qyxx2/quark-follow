@@ -1045,7 +1045,7 @@ def shell_quote(value):
 
 
 BASE_TEMPLATE = """<!doctype html><html lang='zh-CN'><meta name='viewport' content='width=device-width,initial-scale=1'><title>quark-follow 管理</title><style>
-:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body data-page='{{ page_name|default("") }}'><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/container'>容器</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;if(document.body.dataset.page==='dashboard')return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--blue:#2364d2;--ok:#138a4b;--bad:#c83737;--warn:#aa6900}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#14213d;color:white;padding:11px max(12px,calc((100% - 1000px)/2));display:flex;gap:12px;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}header .brand-name{font-weight:700;white-space:nowrap}nav{display:flex;gap:10px;flex-wrap:wrap}a{color:var(--blue);text-decoration:none}header a{color:#fff}.running-tasks{display:flex;gap:5px;flex-wrap:wrap;align-items:center;min-width:0}.task-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ffffff2e;border-radius:999px;background:#ffffff12;color:#eaf0ff;font-size:11px;line-height:1.1;white-space:nowrap}.task-dot{width:5px;height:5px;border-radius:50%;background:#ffd166;display:inline-block;flex:0 0 auto}.container{max-width:1000px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card,form,.tablewrap{background:var(--card);border-radius:10px;padding:15px;box-shadow:0 1px 3px #0001;margin-bottom:14px}.metric{font-size:25px;font-weight:700}.label{color:#657085;font-size:13px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}button,.button{border:0;border-radius:7px;background:var(--blue);color:#fff;padding:10px 13px;font:inherit;cursor:pointer}button.secondary{background:#657085}button.danger{background:var(--bad)}button:disabled{opacity:.5;cursor:not-allowed}input,select,textarea{width:100%;padding:9px;border:1px solid #cbd3e1;border-radius:6px;font:inherit}label{display:block;margin:9px 0 4px;font-weight:600}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #e7eaf0;vertical-align:top}.url{word-break:break-all;overflow-wrap:anywhere}.tablewrap{overflow-x:auto}pre.log{white-space:pre-wrap;overflow-wrap:anywhere;font:12px ui-monospace,SFMono-Regular,monospace;margin:0}.event{padding:8px 0;border-bottom:1px solid #e7eaf0}.tag{font-size:12px;font-weight:bold;padding:2px 5px;border-radius:4px;background:#e8eefc}.flash{padding:10px;background:#e5f7eb;border-radius:7px;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#657085}.day-separator{padding:7px;background:#f0f3f8;color:#657085;font-weight:600}.task-actions{align-items:center}.task-actions form{margin:0;padding:0;background:none;box-shadow:none}@media(max-width:560px){header{align-items:flex-start;flex-direction:column;gap:8px}header .brand{width:100%;align-items:flex-start}.running-tasks{width:100%}nav{gap:9px}.container{padding:10px}th,td{padding:7px 5px}}</style><body data-page='{{ page_name|default("") }}'><header><div class='brand'><span class='brand-name'>quark-follow</span><span id='running-tasks' class='running-tasks' aria-live='polite'></span></div><nav><a href='/'>概览</a><a href='/resources'>资源</a><a href='/api-stats'>API</a><a href='/container'>容器</a><a href='/logs'>日志</a><a href='/config'>配置</a><a href='/logout'>退出</a></nav></header><main class='container'>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class='flash'>{{m}}</div>{% endfor %}{% endwith %}<script>(function(){const root=document.getElementById('running-tasks');if(!root)return;if(document.body.dataset.page==='dashboard')return;const escTask=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function refreshRunningTasks(){try{const r=await fetch('/api/tasks?ts='+Date.now(),{cache:'no-store'});if(!r.ok)return;const d=await r.json();const active=Object.values(d.tasks||{}).filter(x=>x.process_running);root.innerHTML=active.map(x=>{const target=escTask(x.target||'').replace(/^--show-id /,'资源 #').replace(/^--share-id /,'Share #');return `<span class=task-pill><span class=task-dot></span>${escTask(x.label)}${target?' · '+target:''}</span>`;}).join('');}catch(e){}}refreshRunningTasks();setInterval(refreshRunningTasks,3000);})();</script>"""
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -1196,7 +1196,7 @@ def resources():
     for r in rows:
         r['missing'] = max(0, (r['total_episodes'] or 0) - (r['owned'] or 0))
     return render_template_string(
-        BASE_TEMPLATE + """<h1>资源</h1><div class=actions><a class=button href='/resources/add'>添加资源</a><a class='button secondary' href='/resources/excluded'>排除列表</a></div><div class=tablewrap><table><tr><th>名称</th><th>总/拥有/缺失</th><th>Share</th><th>状态</th><th>WebDAV 路径</th></tr>{% for r in rows %}<tr><td><a href='/resources/{{r.id}}'>{{r.name}}</a></td><td>{{r.total_episodes or 0}} / {{r.owned or 0}} / {{r.missing}}</td><td>{{r.share_count}}</td><td>{{'已完成' if r.missing == 0 else '待补集'}}</td><td>{{r.webdav_path}}</td></tr>{% else %}<tr><td colspan=5>数据库暂无资源。</td></tr>{% endfor %}</table></div></main>""",
+        BASE_TEMPLATE + """<h1>资源</h1><div class=actions><a class=button href='/resources/add'>添加资源</a><a class='button secondary' href='/resources/excluded'>排除列表</a><a class='button secondary' href='/resources/manual'>手动管理资源</a></div><div class=tablewrap><table><tr><th>名称</th><th>总/拥有/缺失</th><th>Share</th><th>状态</th><th>WebDAV 路径</th></tr>{% for r in rows %}<tr><td><a href='/resources/{{r.id}}'>{{r.name}}</a></td><td>{{r.total_episodes or 0}} / {{r.owned or 0}} / {{r.missing}}</td><td>{{r.share_count}}</td><td>{{'已完成' if r.missing == 0 else '待补集'}}</td><td>{{r.webdav_path}}</td></tr>{% else %}<tr><td colspan=5>数据库暂无资源。</td></tr>{% endfor %}</table></div></main>""",
         rows=rows,
     )
 
@@ -1258,6 +1258,326 @@ def resource_detail(show_id):
         owned=owned,
         missing=missing,
     )
+
+
+def ensure_manual_shares_table():
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS manual_shares (
+                share_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (share_id) REFERENCES shares(id) ON DELETE CASCADE
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_manual_shares_share_id ON manual_shares(share_id)")
+        con.commit()
+    finally:
+        con.close()
+
+
+def manual_share_season(show_name):
+    season = 1
+    show_name = str(show_name or '')
+    season_match = re.search(r'第\s*([0-9]+|[零〇兩两一二三四五六七八九十百]+)\s*季', show_name)
+    if season_match:
+        raw = season_match.group(1).replace('兩', '二').replace('〇', '零')
+        if raw.isdigit():
+            season = int(raw)
+        else:
+            cn_digits = {
+                '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+                '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+            }
+            if raw in cn_digits:
+                season = cn_digits[raw]
+    else:
+        season_match = re.search(r'(?i)\bSeason\s*([0-9]{1,2})\b', show_name)
+        if season_match:
+            season = int(season_match.group(1))
+        else:
+            season_match = re.search(r'(?i)(?:^|[^A-Za-z0-9])S\s*([0-9]{1,2})(?:[^A-Za-z0-9]|$)', show_name)
+            if season_match:
+                season = int(season_match.group(1))
+    return max(1, season)
+
+
+def manual_share_key(url):
+    match = re.fullmatch(r'https?://pan\.quark\.cn/s/([^/#?\s]+)(?:[?#].*)?', str(url or '').strip(), re.I)
+    return match.group(1) if match else ''
+
+
+def add_manual_shares(show_id, raw_urls):
+    ensure_manual_shares_table()
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    result = {"added": 0, "existing": 0, "invalid": 0, "excluded": 0}
+    seen = set()
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("BEGIN IMMEDIATE")
+        show = con.execute("SELECT id,name FROM shows WHERE id=?", (show_id,)).fetchone()
+        if not show:
+            con.rollback()
+            return None, result
+
+        for raw in raw_urls:
+            raw = raw.strip()
+            if not raw:
+                continue
+            key = manual_share_key(raw)
+            if not key or key in seen:
+                if not key:
+                    result["invalid"] += 1
+                continue
+            seen.add(key)
+            url = f"https://pan.quark.cn/s/{key}"
+            row = con.execute(
+                "SELECT id,status FROM shares WHERE show_id=? AND url=?",
+                (show_id, url),
+            ).fetchone()
+            if row:
+                if row["status"] == "excluded":
+                    result["excluded"] += 1
+                    continue
+                con.execute(
+                    "INSERT OR IGNORE INTO manual_shares(share_id) VALUES(?)",
+                    (row["id"],),
+                )
+                if con.execute(
+                    "SELECT changes()"
+                ).fetchone()[0]:
+                    result["added"] += 1
+                else:
+                    result["existing"] += 1
+                continue
+
+            cursor = con.execute(
+                "INSERT INTO shares(show_id,url,status,pool_type) VALUES(?,?,?,?)",
+                (show_id, url, "pending", "manual"),
+            )
+            share_id = cursor.lastrowid
+            con.execute(
+                "INSERT INTO manual_shares(share_id) VALUES(?)",
+                (share_id,),
+            )
+            result["added"] += 1
+
+        con.commit()
+        return dict(show), result
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def delete_manual_share_db(share_id):
+    ensure_manual_shares_table()
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            """
+            SELECT s.id,s.show_id,s.url,s.status,s.seedhub_rank,s.seedhub_entry_url,sh.name AS show_name
+            FROM manual_shares m
+            JOIN shares s ON s.id=m.share_id
+            JOIN shows sh ON sh.id=s.show_id
+            WHERE s.id=?
+            """,
+            (share_id,),
+        ).fetchone()
+        if not row:
+            con.rollback()
+            return None
+
+        auto_managed = row["seedhub_entry_url"] is not None or row["seedhub_rank"] is not None
+        if auto_managed:
+            con.execute("DELETE FROM manual_shares WHERE share_id=?", (share_id,))
+            con.commit()
+            return {**dict(row), "auto_managed": True, "webdav_unlinked": 0}
+
+        webdav_unlinked = con.execute(
+            "UPDATE webdav_files SET source_share_id=NULL WHERE source_share_id=?",
+            (share_id,),
+        ).rowcount
+        con.execute("DELETE FROM share_files WHERE share_id=?", (share_id,))
+        con.execute("DELETE FROM shares WHERE id=?", (share_id,))
+        con.commit()
+        return {**dict(row), "auto_managed": False, "webdav_unlinked": webdav_unlinked}
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+@app.route('/resources/manual', methods=['GET', 'POST'])
+@login_required
+def manual_resources():
+    ensure_manual_shares_table()
+
+    if request.method == 'POST':
+        show_id = request.form.get('show_id', type=int)
+        raw_urls = request.form.get('urls', '').splitlines()
+        show, result = add_manual_shares(show_id, raw_urls) if show_id else (None, {"added": 0, "existing": 0, "invalid": 0, "excluded": 0})
+        if not show:
+            flash('请选择一个有效的剧集。')
+        else:
+            parts = [f'新增 {result["added"]} 个']
+            if result["existing"]:
+                parts.append(f'已存在 {result["existing"]} 个')
+            if result["invalid"]:
+                parts.append(f'无效 {result["invalid"]} 个')
+            if result["excluded"]:
+                parts.append(f'排除状态 {result["excluded"]} 个（未加入）')
+            flash('；'.join(parts) + '。')
+        return redirect(url_for('manual_resources'))
+
+    shows = db_query("SELECT id,name,total_episodes FROM shows ORDER BY name COLLATE NOCASE,id")
+    rows = db_query(
+        """
+        SELECT m.share_id,m.created_at,s.show_id,s.url,s.status,s.seedhub_rank,s.seedhub_entry_url,
+               sh.name AS show_name,COALESCE(sh.total_episodes,0) AS total_episodes
+        FROM manual_shares m
+        JOIN shares s ON s.id=m.share_id
+        JOIN shows sh ON sh.id=s.show_id
+        ORDER BY sh.name COLLATE NOCASE,m.created_at,m.share_id
+        """
+    )
+
+    share_ids = [r['share_id'] for r in rows]
+    show_ids = sorted({r['show_id'] for r in rows})
+    share_files = {}
+    webdav_files = {}
+    if share_ids:
+        marks = ','.join('?' for _ in share_ids)
+        for r in db_query(
+            f"SELECT share_id,episode FROM share_files WHERE share_id IN ({marks})",
+            share_ids,
+        ):
+            share_files.setdefault(r['share_id'], set()).add(str(r['episode']))
+    if show_ids:
+        marks = ','.join('?' for _ in show_ids)
+        for r in db_query(
+            f"SELECT show_id,episode FROM webdav_files WHERE show_id IN ({marks})",
+            show_ids,
+        ):
+            webdav_files.setdefault(r['show_id'], set()).add(str(r['episode']))
+
+    status_counts = {}
+    useful_shares = 0
+    covered_missing = set()
+    for r in rows:
+        status_counts[r['status']] = status_counts.get(r['status'], 0) + 1
+        r['share_key'] = manual_share_key(r['url']) or r['url']
+        r['auto_managed'] = r['seedhub_entry_url'] is not None or r['seedhub_rank'] is not None
+        r['useful_episodes'] = []
+        if r['status'] == 'valid' and r['total_episodes']:
+            season = manual_share_season(r['show_name'])
+            prefix = f'S{season:02d}E'
+            owned = {
+                int(ep[len(prefix):])
+                for ep in webdav_files.get(r['show_id'], set())
+                if ep.startswith(prefix) and ep[len(prefix):].isdigit()
+            }
+            current = {
+                int(ep[len(prefix):])
+                for ep in share_files.get(r['share_id'], set())
+                if ep.startswith(prefix) and ep[len(prefix):].isdigit()
+            }
+            r['useful_episodes'] = sorted(
+                ep for ep in current
+                if 1 <= ep <= r['total_episodes'] and ep not in owned
+            )
+            if r['useful_episodes']:
+                useful_shares += 1
+                covered_missing.update((r['show_id'], ep) for ep in r['useful_episodes'])
+        r['useful_count'] = len(r['useful_episodes'])
+        r['useful_text'] = ', '.join(f'E{ep:02d}' for ep in r['useful_episodes'])
+
+    return render_template_string(
+        BASE_TEMPLATE + r"""<h1>手动管理资源</h1>
+        <div class=card>
+          <p class=muted>这里维护直接的 Quark Share 链接</p>
+          <form method=post>
+            <label>剧集</label>
+            <select name=show_id required>
+              <option value="">请选择剧集</option>
+              {% for show in shows %}<option value="{{show.id}}">{{show.name}}</option>{% endfor %}
+            </select>
+            <label>Share 链接（每行一个）</label>
+            <textarea name=urls rows=5 placeholder="https://pan.quark.cn/s/xxxxxx&#10;https://pan.quark.cn/s/yyyyyy" required></textarea>
+            <p><button>添加链接</button></p>
+          </form>
+        </div>
+        <div class=grid>
+          <div class=card><div class=label>手动 Share</div><div class=metric>{{rows|length}}</div></div>
+          <div class=card><div class=label>有效</div><div class="metric ok">{{status_counts.get('valid',0)}}</div></div>
+          <div class=card><div class=label>待检查</div><div class="metric warn">{{status_counts.get('pending',0) + status_counts.get('unknown',0)}}</div></div>
+          <div class=card><div class=label>当前可补 Share</div><div class="metric">{{useful_shares}}</div></div>
+          <div class=card><div class=label>可覆盖缺集</div><div class="metric">{{covered_missing|length}}</div></div>
+        </div>
+        <div class=tablewrap><table>
+          <tr><th>Share</th><th>状态</th><th>补集能力</th><th>操作</th></tr>
+          {% for r in rows %}
+          {% if loop.first or r.show_id != rows[loop.index0 - 1].show_id %}<tr><td colspan=4 class=day-separator><a href='/resources/{{r.show_id}}'>{{r.show_name}}</a></td></tr>{% endif %}
+          <tr>
+            <td><a href='{{r.url}}' rel=noopener title='{{r.url}}'><code>{{r.share_key}}</code></a></td>
+            <td>{% if r.status == 'valid' %}<span class=ok>有效</span>{% elif r.status == 'pending' %}<span class=warn>待检查</span>{% elif r.status == 'dead' %}<span class=bad>失效</span>{% elif r.status == 'excluded' %}<span class=bad>已排除</span>{% else %}{{r.status}}{% endif %}</td>
+            <td>{% if r.status == 'valid' and r.useful_count %}<span class=ok>可补 {{r.useful_count}} 集</span><br><span class=muted>{{r.useful_text}}</span>{% elif r.status == 'valid' %}<span class=muted>当前无可补缺集</span>{% elif r.status == 'dead' %}<span class=bad>失效，不能作为补集来源</span>{% else %}<span class=muted>完成检查后判断</span>{% endif %}</td>
+            <td><div class='actions task-actions' style='gap:4px;flex-wrap:nowrap'>{% if r.status != 'excluded' %}<form method=post action='/tasks/source-check/share/{{r.share_id}}'><button type=submit style='padding:4px 7px;font-size:16px;line-height:1' title='重扫' aria-label='重扫'><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.1-6.6L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 15.1 6.6L21 16"/><path d="M21 21v-5h-5"/></svg></button></form>{% endif %}<form method=post action='/resources/manual/{{r.share_id}}/delete' onsubmit="return confirm({{('确定从手动管理中删除此 Share？' + ('\\n\\n该 Share 同时属于自动资源，只会从手动列表移除。' if r.auto_managed else '\\n\\n该 Share 仅属于手动资源，将同时删除其缓存来源记录。') )|tojson}})"><button type=submit class=danger style='padding:4px 7px;font-size:16px;line-height:1' title='删除' aria-label='删除'><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg></button></form></div></td>
+          </tr>
+          {% else %}<tr><td colspan=4>暂无手动 Share。</td></tr>{% endfor %}
+        </table></div>
+        <p><a class=button href='/resources'>返回资源</a></p>
+        </main>""",
+        shows=shows,
+        rows=rows,
+        status_counts=status_counts,
+        useful_shares=useful_shares,
+        covered_missing=covered_missing,
+    )
+
+
+@app.post('/resources/manual/<int:share_id>/delete')
+@login_required
+def delete_manual_resource(share_id):
+    busy = background_work_running()
+    if busy:
+        flash(f'当前有 {busy} 任务正在运行，暂不能删除手动 Share。请等待任务结束后再操作。')
+        write_web_log('DELETE', f'手动 Share 删除请求被拒绝：share_id={share_id} reason={busy}_running')
+        return redirect(url_for('manual_resources'))
+
+    try:
+        row = delete_manual_share_db(share_id)
+    except sqlite3.Error as exc:
+        write_web_log('DELETE', f'删除手动 Share 失败：share_id={share_id} error={exc}')
+        flash(f'删除手动 Share 失败：{exc}')
+        return redirect(url_for('manual_resources'))
+
+    if not row:
+        abort(404)
+
+    if row['auto_managed']:
+        write_web_log(
+            'DELETE',
+            f'手动 Share 已移除但保留自动资源：share_id={share_id} show_id={row["show_id"]} url={row["url"]}',
+        )
+        flash(f'Share {manual_share_key(row["url"])} 已从手动管理中移除；该 Share 属于自动资源，原记录已保留。')
+    else:
+        write_web_log(
+            'DELETE',
+            f'纯手动 Share 已删除：share_id={share_id} show_id={row["show_id"]} url={row["url"]} webdav_unlinked={row["webdav_unlinked"]}',
+        )
+        flash(f'Share {manual_share_key(row["url"])} 已删除。WebDAV 中已有文件未删除。')
+    return redirect(url_for('manual_resources'))
 
 
 def exclude_share_db(show_id, share_id):
@@ -1746,7 +2066,7 @@ def container_page():
             <div class=card><div class=label>解析环境</div><div class="metric ${h.ready?'ok':'warn'}">${h.ready?'就绪':'异常/未就绪'}</div><div>seedhub_cache.py：${h.script_exists?'<span class=ok>✓</span>':'<span class=bad>✗</span>'} · Playwright：${h.playwright?'<span class=ok>✓</span>':'<span class=bad>✗</span>'} · Xvfb：${h.xvfb?'<span class=ok>✓</span>':'<span class=bad>✗</span>'}</div><div class=muted>${esc(h.error||'')}</div></div>
             <div class=card><div class=label>当前 SeedHub 任务</div><div class="metric ${parser.running?'warn':'ok'}">${parser.running?'解析中':'空闲'}</div><div class=label>${parser.pid?'PID '+esc(parser.pid):'无进程'}${parser.target?' · '+esc(parser.target):''}</div><div class=actions style="margin-top:12px"><a class='button secondary' href='/logs?category=PARSE'>查看解析日志</a></div></div>
           </div>
-          <div class=card><div class=label>宿主机 / 容器文件状态</div><div class="metric ${syncClass(s)}">${esc(syncText(s))}</div><p>同步机制：<b>Bind Mount</b> · <code>/docker → /work</code>、<code>项目目录 → /data</code>。实际宿主路径以部署位置为准。</p><p>${esc(s.error||'')}</p><div class=muted>已验证 ${s.summary?.same||0} / ${s.summary?.total||0} 个文件${s.verified?' · SHA256 已实际比对':' · 当前为挂载关系校验，容器侧清单暂不可用'}</div><div class=tablewrap style="margin-top:12px"><table><tr><th>文件</th><th>宿主机</th><th>容器</th><th>状态</th></tr>${files||'<tr><td colspan=4>当前无法取得容器侧文件清单；请先启动容器。</td></tr>'}</table></div></div>
+          <div class=card><div class=label>宿主机 / 容器文件状态</div><div class="metric ${syncClass(s)}">${esc(syncText(s))}</div><p></p><p>${esc(s.error||'')}</p><div class=muted>已验证 ${s.summary?.same||0} / ${s.summary?.total||0} 个文件${s.verified?' · SHA256 已实际比对':' · 当前为挂载关系校验，容器侧清单暂不可用'}</div><div class=tablewrap style="margin-top:12px"><table><tr><th>文件</th><th>宿主机</th><th>容器</th><th>状态</th></tr>${files||'<tr><td colspan=4>当前无法取得容器侧文件清单；请先启动容器。</td></tr>'}</table></div></div>
           <div class=card><div class=label>挂载检查</div><div class="metric ${s.mounts_ok?'ok':'bad'}">${s.mounts_ok?'正常':'异常'}</div><div class=tablewrap><table><tr><th>容器路径</th><th>宿主来源</th><th>类型</th><th>权限</th><th>状态</th></tr>${mounts||'<tr><td colspan=5>暂无挂载信息。</td></tr>'}</table></div></div>
           <div class=card><div class=label>容器诊断</div><div class=tablewrap><table><tr><th>项目</th><th>值</th><th>项目</th><th>值</th></tr><tr><td>Container ID</td><td><code>${esc((c.id||'').slice(0,16)||'—')}</code></td><td>Restart Count</td><td>${c.restart_count??'—'}</td></tr><tr><td>Created</td><td>${esc(c.created||'—')}</td><td>Started</td><td>${esc(c.started_at||'—')}</td></tr><tr><td>Exit Code</td><td>${c.exit_code??'—'}</td><td>OOMKilled</td><td class=${c.oom_killed?'bad':'ok'}>${c.oom_killed?'是':'否'}</td></tr><tr><td>Last Error</td><td colspan=3 class=${c.error?'bad':''}>${esc(c.error||'无')}</td></tr></table></div></div>
           <div class=card><div class=label>最近一次 SeedHub 日志</div>${d.recent_parse?`<span class=tag>PARSE</span> <span class=muted>${esc(d.recent_parse.time)} · ${esc(d.recent_parse.source)}</span><pre class=log>${esc(d.recent_parse.message)}</pre>`:'暂无解析日志'}</div>`;

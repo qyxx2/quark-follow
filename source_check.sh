@@ -151,6 +151,12 @@ sqlite3 "$DB" 'PRAGMA busy_timeout=10000;' >/dev/null 2>&1 || true
 
 sqlite3 "$DB" <<'SQL' >/dev/null
 PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS manual_shares (
+    share_id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (share_id) REFERENCES shares(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_manual_shares_share_id ON manual_shares(share_id);
 CREATE TABLE IF NOT EXISTS share_blacklist (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     show_id INTEGER NOT NULL,
@@ -618,6 +624,22 @@ mark_share_empty() {
 
     current_status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
     [ "$current_status" != "excluded" ] || return 0
+
+    if sqlite3 "$DB" "SELECT 1 FROM manual_shares WHERE share_id=$(sql_quote "$share_id") LIMIT 1;" | grep -qx 1; then
+        sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+UPDATE shares
+   SET status='pending',
+       pending_probe_count=0,
+       fail_count=0,
+       last_check=CURRENT_TIMESTAMP,
+       last_success=NULL,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE id=$(sql_quote "$share_id") AND show_id=$(sql_quote "$show_id");
+SQL
+        log "SOURCE保留手动空 Share：share_id=$share_id show_id=$show_id url=$url；不加入黑名单，下次继续重查"
+        return 0
+    fi
 
     seedhub_entry_url="$(sqlite3 "$DB" "SELECT COALESCE(seedhub_entry_url,'') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
     seedhub_rank="$(sqlite3 "$DB" "SELECT COALESCE(seedhub_rank,'') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
