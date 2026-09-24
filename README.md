@@ -179,7 +179,7 @@ python3 web_app.py
 http://<NAS-IP>:5233
 ```
 
-Web 页面提供资源状态、Share 详情、任务控制、日志筛选、API 调用统计、SeedHub 容器管理和受限配置编辑。
+Web 页面提供资源状态、Share 详情、任务控制、手动资源管理、日志筛选、API 调用统计、SeedHub 容器管理和受限配置编辑。
 
 ## 数据与日志
 
