@@ -136,6 +136,15 @@ def main():
             ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS manual_shares (
+        share_id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (share_id)
+            REFERENCES shares(id)
+            ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS share_blacklist (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         show_id INTEGER NOT NULL,
@@ -154,6 +163,9 @@ def main():
 
     CREATE INDEX IF NOT EXISTS idx_shares_show_rank
         ON shares(show_id, seedhub_rank);
+
+    CREATE INDEX IF NOT EXISTS idx_manual_shares_share_id
+        ON manual_shares(share_id);
 
     CREATE INDEX IF NOT EXISTS idx_shares_show_status
         ON shares(show_id, status);
