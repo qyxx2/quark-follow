@@ -268,6 +268,15 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
             [f"S02E{number:02d}" for number in numbers],
         )
 
+    def test_inference_does_not_use_non_video_webdav_files_as_candidates(self):
+        numbers = (2, 6, 8, 22)
+        rows = [
+            ["__UNPARSED__", f"Series source {number}~4K.srt", "200000000", ""]
+            for number in numbers
+        ]
+        result = self.infer_rows(rows, format="webdav")
+        self.assertEqual([row[0] for row in result], ["__UNPARSED__"] * len(numbers))
+
     def test_all_scanning_scripts_use_the_shared_sequence_inference(self):
         for script_name in ("source_check.sh", "addfile.sh", "resource_check.sh"):
             with self.subTest(script=script_name):
