@@ -40,6 +40,13 @@ def episode_key(value):
     return int(match.group(1)) if match else None
 
 def candidate_tokens(filename):
+    # Source and WebDAV inference must only use actual media files. A numbered
+    # subtitle or artwork set must never be mistaken for missing episode videos.
+    if row_format == "webdav" and filename.rsplit(".", 1)[-1].casefold() not in {
+        "mkv", "mp4", "m2ts", "ts", "avi", "mov", "wmv", "flv", "webm"
+    }:
+        return []
+
     stem = filename.rsplit(".", 1)[0]
     candidates = []
     for match in re.finditer(r"(?<!\d)(\d{1,2})(?!\d)", stem):
