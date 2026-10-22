@@ -686,18 +686,17 @@ scan_share_dir() {
                 continue
             fi
 
-            if [ -n "$key" ]; then
-                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                    "$key" \
-                    "$size" \
-                    "$fid" \
-                    "$share_token" \
-                    "$name" \
-                    "${ext,,}" \
-                    "$relative" >> "$output"
-            else
-                warn "无法解析集数，跳过缓存：share_id=$pwd_id path=$relative$name"
+            if [ -z "$key" ]; then
+                key="__UNPARSED__"
             fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$key" \
+                "$size" \
+                "$fid" \
+                "$share_token" \
+                "$name" \
+                "${ext,,}" \
+                "$relative" >> "$output"
 
         done < <(
             printf '%s' "$result" |
@@ -962,6 +961,22 @@ process_share() {
         mark_share_failure "$share_id" || true
         return 1
     fi
+
+    if ! infer_episode_sequences "$scan_file"; then
+        error "分享集数序列推断失败：share_id=$share_id url=$url"
+        mark_share_failure "$share_id" || true
+        return 1
+    fi
+
+    while IFS=$'\t' read -r episode size fid share_token filename ext relative; do
+        if [ "$episode" = "__UNPARSED__" ]; then
+            warn "无法解析集数，跳过缓存：share_id=$pwd_id path=$relative$filename"
+        fi
+    done < "$scan_file"
+
+    local resolved_file="$TMP_ROOT/share_${share_id}.resolved.tsv"
+    awk -F '\t' '$1 != "__UNPARSED__" && $1 != ""' "$scan_file" > "$resolved_file"
+    mv "$resolved_file" "$scan_file"
 
     local dedup_file="$TMP_ROOT/share_${share_id}.dedup.tsv"
     awk -F '\t' 'BEGIN{OFS="\t"} {k=$1 SUBSEP $5; if (!(k in size) || $2 > size[k]) {size[k]=$2; line[k]=$0}} END {for(k in line) print line[k]}' "$scan_file" > "$dedup_file"
