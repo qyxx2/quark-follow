@@ -397,9 +397,9 @@ parse_episode() {
 
         if [[ "$stem" =~ 第[[:space:]]*([0-9]+|[零一二两三四五六七八九十百]+)[[:space:]]*集 ]]; then
             episode="$(cn_number "${BASH_REMATCH[1]}")" || return 1
-        elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})[[:space:]_.-]*$ ]]; then
+        elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,2})[[:space:]_.~-]*$ ]]; then
             episode=$((10#${BASH_REMATCH[1]}))
-        elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,3})([[:space:]_.-]+|\(|\[|（|【).+ ]]; then
+        elif [[ "$stem" =~ ^[[:space:]]*([0-9]{1,2})([[:space:]_.~-]+|\(|\[|（|【).+ ]]; then
             # Number-led episode names often append quality/codec metadata after the episode:
             # 01.4K.SDR.60fps.mp4, 13-1080P.mp4, 01[HDR].mkv, etc.
             episode=$((10#${BASH_REMATCH[1]}))
