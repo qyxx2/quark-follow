@@ -11,12 +11,19 @@ SOURCE_CHECK = (ROOT / "source_check.sh").read_text(encoding="utf-8")
 
 
 def extract_bash_function(source, name):
+    start = source.find(f"{name}() {{\n")
+    if start < 0:
+        raise AssertionError(f"Could not find Bash function: {name}")
+    if name == "infer_episode_sequences":
+        end = source.find("\nPY\n}", start)
+        if end < 0:
+            raise AssertionError(f"Could not find heredoc end for Bash function: {name}")
+        return source[start:end + len("\nPY\n}")]
     pattern = re.compile(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}$")
-    match = pattern.search(source)
+    match = pattern.search(source, start)
     if not match:
         raise AssertionError(f"Could not find Bash function: {name}")
     return match.group(0)
-
 
 class ParseEpisodeRegressionTests(unittest.TestCase):
     @classmethod
