@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for source_check.sh episode-number parsing."""
+"""Regression tests for shared episode parsing and sequence inference."""
 from pathlib import Path
 import re
 import subprocess
@@ -15,11 +15,6 @@ def extract_bash_function(source, name):
     start = source.find(f"{name}() {{\n")
     if start < 0:
         raise AssertionError(f"Could not find Bash function: {name}")
-    if name == "infer_episode_sequences":
-        end = source.find("\nPY\n}", start)
-        if end < 0:
-            raise AssertionError(f"Could not find heredoc end for Bash function: {name}")
-        return source[start:end + len("\nPY\n}")]
     pattern = re.compile(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}$")
     match = pattern.search(source, start)
     if not match:
