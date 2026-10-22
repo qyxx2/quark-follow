@@ -463,7 +463,7 @@ def candidate_tokens(filename):
     return candidates
 
 token_rows = {
-    index: candidate_tokens(row[4])
+    index: candidate_tokens((row[6] + "/" if row[6] else "") + row[4])
     for index, row in enumerate(rows)
     if len(row) >= 7
 }
