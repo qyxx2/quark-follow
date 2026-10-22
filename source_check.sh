@@ -416,6 +416,161 @@ parse_episode() {
     printf 'S%02dE%02d' "$season" "$episode"
 }
 
+
+infer_episode_sequences() {
+    local scan_file="$1"
+
+    python3 - "$scan_file" <<'PY'
+import os
+import re
+import sys
+
+scan_path = sys.argv[1]
+marker = "__UNPARSED__"
+
+with open(scan_path, "r", encoding="utf-8") as stream:
+    rows = [line.rstrip("\n").split("\t") for line in stream if line.rstrip("\n")]
+
+def natural_key(value):
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", value)
+    )
+
+def episode_key(value):
+    match = re.fullmatch(r"S\d{2}E(\d{1,4})", value)
+    return int(match.group(1)) if match else None
+
+def candidate_tokens(filename):
+    stem = filename.rsplit(".", 1)[0]
+    candidates = []
+    for match in re.finditer(r"(?<!\d)(\d{1,2})(?!\d)", stem):
+        value = int(match.group(1))
+        if value < 1:
+            continue
+
+        suffix = stem[match.end():]
+        if re.match(r"(?i)^(?:k|fps|hz|bit|p)\b", suffix) or re.match(r"(?i)^-bit\b", suffix):
+            continue
+
+        prefix = stem[:match.start()]
+        labeled_before = re.search(
+            r"(?i)(?:episode|ep|part|第|集|话|回|期)\s*[-_.~#\[\]()（）【】]*$",
+            prefix,
+        ) is not None
+        labeled_after = re.match(r"\s*(?:集|话|回|期)", suffix) is not None
+        candidates.append((value, labeled_before or labeled_after))
+    return candidates
+
+token_rows = {
+    index: candidate_tokens(row[4])
+    for index, row in enumerate(rows)
+    if len(row) >= 7
+}
+
+def infer_group(indices, sort_by_path=False):
+    unresolved = [index for index in indices if rows[index][0] == marker]
+    if not unresolved:
+        return
+
+    ordered = sorted(
+        indices,
+        key=lambda index: natural_key(
+            (rows[index][6] + "/" if sort_by_path and rows[index][6] else "")
+            + rows[index][4]
+        ),
+    )
+    max_slots = max((len(token_rows.get(index, [])) for index in ordered), default=0)
+    eligible = []
+    minimum_coverage = max(3, (len(ordered) + 1) // 2)
+
+    for slot in range(max_slots):
+        entries = [
+            (index, token_rows[index][slot])
+            for index in ordered
+            if slot < len(token_rows.get(index, []))
+        ]
+        values = [token[0] for _, token in entries]
+        distinct = set(values)
+        if len(entries) < minimum_coverage or len(distinct) < 3:
+            continue
+
+        increasing = all(left <= right for left, right in zip(values, values[1:]))
+        decreasing = all(left >= right for left, right in zip(values, values[1:]))
+        if not increasing and not decreasing:
+            continue
+
+        anchor_matches = 0
+        anchor_mismatches = 0
+        for index, token in entries:
+            known_episode = episode_key(rows[index][0])
+            if known_episode is None or rows[index][0] == marker:
+                continue
+            if token[0] == known_episode:
+                anchor_matches += 1
+            else:
+                anchor_mismatches += 1
+
+        if anchor_mismatches and not anchor_matches:
+            continue
+
+        label_votes = sum(1 for _, token in entries if token[1])
+        score = (
+            anchor_matches * 1000
+            - anchor_mismatches * 500
+            + label_votes * 25
+            + len(distinct) * 5
+            + len(entries)
+        )
+        minimum, maximum = min(values), max(values)
+        assignments = {}
+        for index in unresolved:
+            tokens = token_rows.get(index, [])
+            value = None
+            if slot < len(tokens):
+                value = tokens[slot][0]
+            elif len(tokens) == 1:
+                value = tokens[0][0]
+
+            if value is not None and minimum <= value <= maximum:
+                assignments[index] = value
+
+        if assignments:
+            eligible.append((score, slot, assignments))
+
+    if not eligible:
+        return
+
+    best_score = max(candidate[0] for candidate in eligible)
+    best = [candidate for candidate in eligible if candidate[0] == best_score]
+    signatures = {
+        tuple(sorted(candidate[2].items()))
+        for candidate in best
+    }
+    if len(signatures) != 1:
+        return
+
+    assignments = best[0][2]
+    for index, value in assignments.items():
+        rows[index][0] = f"S01E{value:02d}"
+
+directory_groups = {}
+for index, row in enumerate(rows):
+    if len(row) >= 7:
+        directory_groups.setdefault(row[6], []).append(index)
+
+for indices in directory_groups.values():
+    infer_group(indices)
+infer_group(list(range(len(rows))), sort_by_path=True)
+
+temporary_path = scan_path + ".inferred"
+with open(temporary_path, "w", encoding="utf-8") as stream:
+    for row in rows:
+        stream.write("\t".join(row) + "\n")
+os.replace(temporary_path, scan_path)
+PY
+}
+
 is_video() {
     local ext="${1##*.}"
     ext="${ext,,}"
