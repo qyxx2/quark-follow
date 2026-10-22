@@ -103,14 +103,15 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
                 "".join("\t".join(row) + "\n" for row in rows),
                 encoding="utf-8",
             )
+            command = [
+                "python3", str(EPISODE_SEQUENCE),
+                "--season", str(season),
+            ]
+            if format != "source":
+                command.extend(["--format", format])
+            command.append(str(scan_file))
             result = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    function + '\ninfer_episode_sequences "$1"\n',
-                    "infer-episode-sequence-test",
-                    str(scan_file),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 check=False,
