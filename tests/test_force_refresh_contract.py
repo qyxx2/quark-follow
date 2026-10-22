@@ -52,5 +52,18 @@ class ForcedRefreshContractTests(unittest.TestCase):
         self.assertIn("return start_task('source_check.sh', [f'--{kind}-id', str(target_id)], '数据库同步')", WEB_APP)
 
 
+    def test_global_header_exposes_openlist_from_config_and_hides_empty_value(self):
+        template_start = WEB_APP.index("BASE_TEMPLATE =")
+        template_end = WEB_APP.index("\\n\\n@app.route('/login'", template_start)
+        template = WEB_APP[template_start:template_end]
+
+        self.assertIn("@app.context_processor", WEB_APP)
+        self.assertIn("def inject_openlist_url():", WEB_APP)
+        self.assertIn('config_values().get("OPENLIST_URL", "").strip()', WEB_APP)
+        self.assertIn("{% if openlist_url %}", template)
+        self.assertIn("href='{{ openlist_url }}'", template)
+        self.assertIn("target='_blank' rel='noopener noreferrer'", template)
+
+
 if __name__ == "__main__":
     unittest.main()
