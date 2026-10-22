@@ -477,7 +477,8 @@ def state_score(path, label_votes):
     unknown_count = sum(1 for _, _, is_unknown in path if is_unknown)
     anchor_count = len(path) - unknown_count
     distinct_count = len({value for _, value, _ in path})
-    return (unknown_count, anchor_count, distinct_count, label_votes)
+    # Prefer sequences that cover more files and agree with known episode formats.
+    return (len(path), anchor_count, unknown_count, distinct_count, label_votes)
 
 def offer_state(states, last_value, path, label_votes):
     candidate = (path, label_votes)
@@ -534,7 +535,7 @@ def infer_direction(ordered, direction, minimum_coverage):
     for bucket in states.values():
         for path, labels in bucket:
             score = state_score(path, labels)
-            if score[0] >= minimum_coverage and score[2] >= 3:
+            if score[0] >= minimum_coverage and score[2] > 0 and score[3] >= 3:
                 inferred = tuple((index, value) for index, value, is_unknown in path if is_unknown)
                 eligible.append((score, inferred))
 
@@ -564,7 +565,7 @@ def infer_group(indices, sort_by_path=False):
             + rows[index][4]
         ),
     )
-    minimum_coverage = max(3, (len(unresolved) + 1) // 2)
+    minimum_coverage = max(3, (len(indices) + 1) // 2)
     options = [
         infer_direction(ordered, direction, minimum_coverage)
         for direction in ("ascending", "descending")
