@@ -437,10 +437,6 @@ def natural_key(value):
         for part in re.split(r"(\d+)", value)
     )
 
-def episode_key(value):
-    match = re.fullmatch(r"S\d{2}E(\d{1,4})", value)
-    return int(match.group(1)) if match else None
-
 def candidate_tokens(filename):
     stem = filename.rsplit(".", 1)[0]
     candidates = []
@@ -450,17 +446,23 @@ def candidate_tokens(filename):
             continue
 
         suffix = stem[match.end():]
+        # Short numbers attached to common quality/encoding metadata are not episodes.
         if re.match(r"(?i)^(?:k|fps|hz|bit|p)\b", suffix) or re.match(r"(?i)^-bit\b", suffix):
             continue
 
         prefix = stem[:match.start()]
         labeled_before = re.search(
-            r"(?i)(?:episode|ep|part|第|集|话|回|期)\s*[-_.~#\[\]()（）【】]*$",
+            r"(?i)(?:\bepisode\b|\bep\b|\bpart\b|第|集|话|回|期)\s*[-_.~#\[\]()（）【】]*$",
             prefix,
         ) is not None
         labeled_after = re.match(r"\s*(?:集|话|回|期)", suffix) is not None
         candidates.append((value, labeled_before or labeled_after))
-    return candidates
+
+    # A file can contain the same short number more than once; keep its strongest context.
+    by_value = {}
+    for value, labeled in candidates:
+        by_value[value] = by_value.get(value, False) or labeled
+    return [(value, labeled) for value, labeled in by_value.items()]
 
 token_rows = {
     index: candidate_tokens((row[6] + "/" if row[6] else "") + row[4])
@@ -468,90 +470,101 @@ token_rows = {
     if len(row) >= 7
 }
 
+def state_score(path, label_votes):
+    return (len(path), len({value for _, value in path}), label_votes)
+
+def offer_state(states, last_value, path, label_votes):
+    candidate = (path, label_votes)
+    score = state_score(path, label_votes)
+    bucket = states.setdefault(last_value, [])
+    if bucket:
+        best_score = state_score(bucket[0][0], bucket[0][1])
+        if score < best_score:
+            return
+        if score > best_score:
+            bucket.clear()
+    if any(existing_path == path for existing_path, _ in bucket):
+        return
+    # Preserve multiple equal-score paths so ambiguous numeric fields are rejected.
+    if len(bucket) < 2:
+        bucket.append(candidate)
+
+def infer_direction(ordered, direction, minimum_coverage):
+    states = {}
+    for index in ordered:
+        options = token_rows.get(index, [])
+        previous_states = [
+            (last_value, path, labels)
+            for last_value, bucket in states.items()
+            for path, labels in bucket
+        ]
+        next_states = {last_value: list(bucket) for last_value, bucket in states.items()}
+
+        for value, labeled in options:
+            offer_state(next_states, value, ((index, value),), int(labeled))
+            for last_value, path, labels in previous_states:
+                follows_order = (
+                    last_value <= value if direction == "ascending"
+                    else last_value >= value
+                )
+                if follows_order:
+                    offer_state(
+                        next_states,
+                        value,
+                        path + ((index, value),),
+                        labels + int(labeled),
+                    )
+        states = next_states
+
+    eligible = []
+    for bucket in states.values():
+        for path, labels in bucket:
+            score = state_score(path, labels)
+            if len(path) >= minimum_coverage and score[1] >= 3:
+                eligible.append((score, path))
+
+    if not eligible:
+        return None
+
+    best_score = max(score for score, _ in eligible)
+    best_paths = [
+        path for score, path in eligible
+        if score == best_score
+    ]
+    signatures = {tuple(sorted(path)) for path in best_paths}
+    if len(signatures) != 1:
+        return None
+
+    return best_score, dict(best_paths[0])
+
 def infer_group(indices, sort_by_path=False):
     unresolved = [index for index in indices if rows[index][0] == marker]
     if not unresolved:
         return
 
     ordered = sorted(
-        indices,
+        unresolved,
         key=lambda index: natural_key(
             (rows[index][6] + "/" if sort_by_path and rows[index][6] else "")
             + rows[index][4]
         ),
     )
-    max_slots = max((len(token_rows.get(index, [])) for index in ordered), default=0)
-    eligible = []
     minimum_coverage = max(3, (len(ordered) + 1) // 2)
-
-    for slot in range(max_slots):
-        entries = [
-            (index, token_rows[index][slot])
-            for index in ordered
-            if slot < len(token_rows.get(index, []))
-        ]
-        values = [token[0] for _, token in entries]
-        distinct = set(values)
-        if len(entries) < minimum_coverage or len(distinct) < 3:
-            continue
-
-        increasing = all(left <= right for left, right in zip(values, values[1:]))
-        decreasing = all(left >= right for left, right in zip(values, values[1:]))
-        if not increasing and not decreasing:
-            continue
-
-        anchor_matches = 0
-        anchor_mismatches = 0
-        for index, token in entries:
-            known_episode = episode_key(rows[index][0])
-            if known_episode is None or rows[index][0] == marker:
-                continue
-            if token[0] == known_episode:
-                anchor_matches += 1
-            else:
-                anchor_mismatches += 1
-
-        if anchor_mismatches and not anchor_matches:
-            continue
-
-        label_votes = sum(1 for _, token in entries if token[1])
-        score = (
-            anchor_matches * 1000
-            - anchor_mismatches * 500
-            + label_votes * 25
-            + len(distinct) * 5
-            + len(entries)
-        )
-        minimum, maximum = min(values), max(values)
-        assignments = {}
-        for index in unresolved:
-            tokens = token_rows.get(index, [])
-            value = None
-            if slot < len(tokens):
-                value = tokens[slot][0]
-            elif len(tokens) == 1:
-                value = tokens[0][0]
-
-            if value is not None and minimum <= value <= maximum:
-                assignments[index] = value
-
-        if assignments:
-            eligible.append((score, slot, assignments))
-
-    if not eligible:
+    options = [
+        infer_direction(ordered, direction, minimum_coverage)
+        for direction in ("ascending", "descending")
+    ]
+    options = [option for option in options if option is not None]
+    if not options:
         return
 
-    best_score = max(candidate[0] for candidate in eligible)
-    best = [candidate for candidate in eligible if candidate[0] == best_score]
-    signatures = {
-        tuple(sorted(candidate[2].items()))
-        for candidate in best
-    }
+    best_score = max(score for score, _ in options)
+    best = [mapping for score, mapping in options if score == best_score]
+    signatures = {tuple(sorted(mapping.items())) for mapping in best}
     if len(signatures) != 1:
         return
 
-    assignments = best[0][2]
-    for index, value in assignments.items():
+    for index, value in best[0].items():
         rows[index][0] = f"S01E{value:02d}"
 
 directory_groups = {}
