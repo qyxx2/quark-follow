@@ -3,6 +3,7 @@
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,7 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         cases = {
             "01.4K.SDR.60fps..mp4": "S01E01",
             "02.4K.SDR.60fps.mp4": "S01E02",
+            "02~4K.mp4": "S01E02",
             "13-4K.高码率.mp4": "S01E13",
             "14-1080P.高码率.mp4": "S01E14",
             "07_2160p_HDR.mkv": "S01E07",
@@ -50,7 +52,6 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
             "09[1080p].mkv": "S01E09",
             "10(4K).mkv": "S01E10",
             "11【1080p】.mp4": "S01E11",
-            "123 - Complete.Title.mkv": "S01E123",
         }
         for filename, expected in cases.items():
             with self.subTest(filename=filename):
@@ -78,6 +79,83 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
                 result = self.parse(filename)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
+
+
+    def test_number_led_episode_candidates_reject_three_digit_numbers(self):
+        for filename in ("123 - Complete.Title.mkv", "1000-2160p.Movie.mkv"):
+            with self.subTest(filename=filename):
+                result = self.parse(filename)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def infer_rows(self, rows):
+        function = extract_bash_function(SOURCE_CHECK, "infer_episode_sequences")
+        with tempfile.TemporaryDirectory() as tempdir:
+            scan_file = Path(tempdir) / "scan.tsv"
+            scan_file.write_text(
+                "".join("\\t".join(row) + "\\n" for row in rows),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    function + '\\ninfer_episode_sequences "$1"\\n',
+                    "infer-episode-sequence-test",
+                    str(scan_file),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return [line.split("\\t") for line in scan_file.read_text(encoding="utf-8").splitlines()]
+
+    def test_infers_episode_numbers_anywhere_in_incrementing_file_set(self):
+        numbers = (2, 6, 8, 22, 24)
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token", f"Show source {n}~4K SDR 60fps.mp4", "mp4", ""]
+            for i, n in enumerate(numbers)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual([row[0] for row in result], [f"S01E{n:02d}" for n in numbers])
+
+    def test_infers_descending_episode_sequence_when_numeric_field_is_not_first(self):
+        samples = [
+            ("Alpha release 24~4K.mp4", 24),
+            ("Bravo release 22~4K.mp4", 22),
+            ("Charlie release 08~4K.mp4", 8),
+            ("Delta release 06~4K.mp4", 6),
+            ("Echo release 02~4K.mp4", 2),
+        ]
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token", filename, "mp4", ""]
+            for i, (filename, _) in enumerate(samples)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual(
+            [row[0] for row in result],
+            [f"S01E{number:02d}" for _, number in samples],
+        )
+
+    def test_inference_ignores_resolution_year_and_frame_rate_numbers(self):
+        numbers = (1, 2, 3, 4)
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token",
+             f"Series version {n} 2024 1080p 4K 60fps.mkv", "mkv", ""]
+            for i, n in enumerate(numbers)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual([row[0] for row in result], [f"S01E{n:02d}" for n in numbers])
+
+    def test_does_not_infer_without_a_consistent_multi_file_sequence(self):
+        filenames = ["Movie release 2024 4K.mp4", "Movie release 2025 4K.mp4"]
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token", filename, "mp4", ""]
+            for i, filename in enumerate(filenames)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual([row[0] for row in result], ["__UNPARSED__", "__UNPARSED__"])
 
 
 if __name__ == "__main__":
