@@ -3,7 +3,6 @@
 import argparse
 import os
 import re
-import sys
 
 parser = argparse.ArgumentParser(description="Infer episode numbers from a scanned TSV file.")
 parser.add_argument("--format", choices=("source", "webdav"), default="source")
