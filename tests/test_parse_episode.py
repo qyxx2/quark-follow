@@ -93,14 +93,14 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             scan_file = Path(tempdir) / "scan.tsv"
             scan_file.write_text(
-                "".join("\\t".join(row) + "\\n" for row in rows),
+                "".join("\t".join(row) + "\n" for row in rows),
                 encoding="utf-8",
             )
             result = subprocess.run(
                 [
                     "bash",
                     "-c",
-                    function + '\\ninfer_episode_sequences "$1"\\n',
+                    function + '\ninfer_episode_sequences "$1"\n',
                     "infer-episode-sequence-test",
                     str(scan_file),
                 ],
@@ -109,7 +109,7 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            return [line.split("\\t") for line in scan_file.read_text(encoding="utf-8").splitlines()]
+            return [line.split("\t") for line in scan_file.read_text(encoding="utf-8").splitlines()]
 
     def test_infers_episode_numbers_anywhere_in_incrementing_file_set(self):
         numbers = (2, 6, 8, 22, 24)
@@ -143,6 +143,16 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         rows = [
             ["__UNPARSED__", "200000000", str(i), "token",
              f"Series version {n} 2024 1080p 4K 60fps.mkv", "mkv", ""]
+            for i, n in enumerate(numbers)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual([row[0] for row in result], [f"S01E{n:02d}" for n in numbers])
+
+
+    def test_infers_episode_number_from_numeric_parent_directory(self):
+        numbers = (2, 6, 8, 22, 24)
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token", "EpisodeClip.mp4", "mp4", f"Disc {n:02d}/"]
             for i, n in enumerate(numbers)
         ]
         result = self.infer_rows(rows)
