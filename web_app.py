@@ -1877,6 +1877,7 @@ def start_source_check(kind, target_id):
     return start_task('source_check.sh', [f'--{kind}-id', str(target_id)], '数据库同步')
 
 
+
 _TASK_QUEUE_POLL_INTERVAL = 1.0
 _task_queue_thread = None
 _task_queue_thread_lock = threading.Lock()
@@ -1892,32 +1893,11 @@ def ensure_task_queue_table():
                 script TEXT NOT NULL,
                 args_json TEXT NOT NULL,
                 label TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                started_at TEXT,
-                finished_at TEXT,
-                pid INTEGER,
-                exit_code INTEGER,
-                error TEXT
+                requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
         con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_web_task_queue_status_id "
-            "ON web_task_queue(status,id)"
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def _finish_queued_task(task_id, status, exit_code=None, error=None):
-    con = sqlite3.connect(DB, timeout=10)
-    try:
-        con.execute("PRAGMA busy_timeout=10000")
-        con.execute(
-            "UPDATE web_task_queue SET status=?,finished_at=CURRENT_TIMESTAMP,"
-            "exit_code=?,error=?,pid=NULL WHERE id=?",
-            (status, exit_code, error, task_id),
+            "CREATE INDEX IF NOT EXISTS idx_web_task_queue_id ON web_task_queue(id)"
         )
         con.commit()
     finally:
@@ -1930,116 +1910,81 @@ def task_queue_worker():
         if not DB.is_file():
             time.sleep(_TASK_QUEUE_POLL_INTERVAL)
             continue
-
         if not initialized:
             try:
                 ensure_task_queue_table()
-                con = sqlite3.connect(DB, timeout=10)
-                try:
-                    con.execute("PRAGMA busy_timeout=10000")
-                    # Recover interrupted jobs. Any surviving script is allowed to finish
-                    # before the re-queued job is started.
-                    con.execute(
-                        "UPDATE web_task_queue SET status='queued',started_at=NULL,"
-                        "finished_at=NULL,pid=NULL,error='requeued after web restart' "
-                        "WHERE status='running'"
-                    )
-                    con.commit()
-                finally:
-                    con.close()
                 initialized = True
             except (OSError, sqlite3.Error) as exc:
-                try:
-                    write_web_log("ERROR", f"任务队列初始化失败：{exc}")
-                except Exception:
-                    pass
+                write_web_log("ERROR", f"任务队列初始化失败：{exc}")
                 time.sleep(_TASK_QUEUE_POLL_INTERVAL)
                 continue
 
-        task_id = None
         child = None
-        label = ""
+        task_id = None
         script = ""
         args = []
+        label = ""
+        start_error = ""
         try:
             with launch_lock:
-                busy = background_work_running(task_status())
-                if not busy:
+                # Let already-running scripts finish; queued requests remain durable in SQLite.
+                if not background_work_running(task_status()):
                     con = sqlite3.connect(DB, timeout=10)
                     try:
                         con.execute("PRAGMA busy_timeout=10000")
                         con.execute("BEGIN IMMEDIATE")
                         row = con.execute(
                             "SELECT id,script,args_json,label FROM web_task_queue "
-                            "WHERE status='queued' ORDER BY id LIMIT 1"
+                            "ORDER BY id LIMIT 1"
                         ).fetchone()
                         if row:
                             task_id, script, args_json, label = row
-                            con.execute(
-                                "UPDATE web_task_queue SET status='running',"
-                                "started_at=CURRENT_TIMESTAMP,error=NULL WHERE id=? "
-                                "AND status='queued'",
-                                (task_id,),
-                            )
-                            if con.execute("SELECT changes()").fetchone()[0] != 1:
-                                task_id = None
-                            con.commit()
-                        else:
-                            con.commit()
+                            args = json.loads(args_json)
+                            LOG_DIR.mkdir(parents=True, exist_ok=True)
+                            try:
+                                with (LOG_DIR / "web_launcher.log").open("ab") as output:
+                                    child = subprocess.Popen(
+                                        [str(BASE / script), *args],
+                                        cwd=BASE,
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=output,
+                                        stderr=subprocess.STDOUT,
+                                        start_new_session=True,
+                                        close_fds=True,
+                                    )
+                            except OSError as exc:
+                                start_error = str(exc)
+                            # Remove only after the launch attempt, so queued work survives
+                            # a Web restart or transient SQLite failure.
+                            con.execute("DELETE FROM web_task_queue WHERE id=?", (task_id,))
+                        con.commit()
                     except Exception:
                         con.rollback()
                         raise
                     finally:
                         con.close()
 
-                    if task_id is not None:
-                        args = json.loads(args_json)
-                        log_path = LOG_DIR / "web_launcher.log"
-                        LOG_DIR.mkdir(parents=True, exist_ok=True)
-                        with log_path.open("ab") as output:
-                            child = subprocess.Popen(
-                                [str(BASE / script), *args],
-                                cwd=BASE,
-                                stdin=subprocess.DEVNULL,
-                                stdout=output,
-                                stderr=subprocess.STDOUT,
-                                start_new_session=True,
-                                close_fds=True,
-                            )
-                        con = sqlite3.connect(DB, timeout=10)
-                        try:
-                            con.execute(
-                                "UPDATE web_task_queue SET pid=? WHERE id=? AND status='running'",
-                                (child.pid, task_id),
-                            )
-                            con.commit()
-                        finally:
-                            con.close()
-                        _invalidate_process_snapshot_cache()
-                        write_web_log(
-                            "INIT",
-                            f"队列任务开始：queue_id={task_id} script={script} "
-                            f"pid={child.pid} args={' '.join(args)} label={label}",
-                        )
-
-            if task_id is None:
+            if start_error:
+                write_web_log(
+                    "ERROR",
+                    f"队列任务启动失败：queue_id={task_id} script={script} error={start_error}",
+                )
+            elif child is not None:
+                _invalidate_process_snapshot_cache()
+                write_web_log(
+                    "INIT",
+                    f"队列任务开始：queue_id={task_id} script={script} "
+                    f"pid={child.pid} args={' '.join(args)} label={label}",
+                )
+                exit_code = child.wait()
+                write_web_log(
+                    "INIT" if exit_code == 0 else "ERROR",
+                    f"队列任务结束：queue_id={task_id} script={script} "
+                    f"exit_code={exit_code} label={label}",
+                )
+            else:
                 time.sleep(_TASK_QUEUE_POLL_INTERVAL)
-                continue
-
-            exit_code = child.wait()
-            status = "succeeded" if exit_code == 0 else "failed"
-            _finish_queued_task(task_id, status, exit_code=exit_code)
-            write_web_log(
-                "INIT" if exit_code == 0 else "ERROR",
-                f"队列任务结束：queue_id={task_id} script={script} "
-                f"exit_code={exit_code} status={status} label={label}",
-            )
         except Exception as exc:
-            if task_id is not None:
-                try:
-                    _finish_queued_task(task_id, "failed", error=str(exc)[:1000])
-                except Exception:
-                    pass
             try:
                 write_web_log(
                     "ERROR",
@@ -2080,13 +2025,12 @@ def start_task(script, args, label=None):
                 try:
                     con.execute("PRAGMA busy_timeout=10000")
                     cursor = con.execute(
-                        "INSERT INTO web_task_queue(script,args_json,label,status) "
-                        "VALUES(?,?,?,'queued')",
+                        "INSERT INTO web_task_queue(script,args_json,label) VALUES(?,?,?)",
                         (script, json.dumps(list(args), ensure_ascii=False), task_label),
                     )
                     queue_id = cursor.lastrowid
                     waiting = con.execute(
-                        "SELECT COUNT(*) FROM web_task_queue WHERE status='queued'"
+                        "SELECT COUNT(*) FROM web_task_queue"
                     ).fetchone()[0]
                     con.commit()
                 finally:
