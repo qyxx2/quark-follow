@@ -54,7 +54,7 @@ class ForcedRefreshContractTests(unittest.TestCase):
 
     def test_global_header_exposes_openlist_from_config_and_hides_empty_value(self):
         template_start = WEB_APP.index("BASE_TEMPLATE =")
-        template_end = WEB_APP.index("\\n\\n@app.route('/login'", template_start)
+        template_end = WEB_APP.index("\n\n@app.route('/login'", template_start)
         template = WEB_APP[template_start:template_end]
 
         self.assertIn("@app.context_processor", WEB_APP)
