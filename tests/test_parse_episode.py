@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_CHECK = (ROOT / "source_check.sh").read_text(encoding="utf-8")
+EPISODE_SEQUENCE = ROOT / "episode_sequence.py"
 
 
 def extract_bash_function(source, name):
@@ -95,8 +96,7 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
-    def infer_rows(self, rows):
-        function = extract_bash_function(SOURCE_CHECK, "infer_episode_sequences")
+    def infer_rows(self, rows, *, format="source", season=1):
         with tempfile.TemporaryDirectory() as tempdir:
             scan_file = Path(tempdir) / "scan.tsv"
             scan_file.write_text(
@@ -254,6 +254,24 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         ]
         result = self.infer_rows(rows)
         self.assertEqual([row[0] for row in result], ["__UNPARSED__", "__UNPARSED__"])
+
+    def test_inference_supports_webdav_rows_and_requested_season(self):
+        numbers = (2, 6, 8, 22)
+        rows = [
+            ["__UNPARSED__", f"Series source {number}~4K.mkv", "200000000", ""]
+            for number in numbers
+        ]
+        result = self.infer_rows(rows, format="webdav", season=2)
+        self.assertEqual(
+            [row[0] for row in result],
+            [f"S02E{number:02d}" for number in numbers],
+        )
+
+    def test_all_scanning_scripts_use_the_shared_sequence_inference(self):
+        for script_name in ("source_check.sh", "addfile.sh", "resource_check.sh"):
+            with self.subTest(script=script_name):
+                script = (ROOT / script_name).read_text(encoding="utf-8")
+                self.assertIn("episode_sequence.py", script)
 
 
 if __name__ == "__main__":
