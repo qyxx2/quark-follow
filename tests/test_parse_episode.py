@@ -184,6 +184,25 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
             [f"S01E{number:02d}" for _, number in samples],
         )
 
+
+    def test_existing_parsed_episode_anchors_help_infer_unparsed_files(self):
+        samples = [
+            ("S01E02", "02.4K.SDR.60fps.mp4"),
+            ("__UNPARSED__", "Series 06~4K.mp4"),
+            ("__UNPARSED__", "Series 08~4K.mp4"),
+            ("__UNPARSED__", "Series 22~4K.mp4"),
+            ("__UNPARSED__", "Series 24~4K.mp4"),
+        ]
+        rows = [
+            [episode, "200000000", str(i), "token", filename, "mp4", ""]
+            for i, (episode, filename) in enumerate(samples)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual(
+            [row[0] for row in result],
+            ["S01E02", "S01E06", "S01E08", "S01E22", "S01E24"],
+        )
+
     def test_keeps_ambiguous_numeric_fields_unresolved(self):
         numbers = ((2, 11), (6, 14), (8, 16))
         rows = [
