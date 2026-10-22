@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_CHECK = (ROOT / "source_check.sh").read_text(encoding="utf-8")
+ADDFILE = (ROOT / "addfile.sh").read_text(encoding="utf-8")
 EPISODE_SEQUENCE = ROOT / "episode_sequence.py"
 
 
@@ -271,6 +272,38 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         ]
         result = self.infer_rows(rows, format="webdav")
         self.assertEqual([row[0] for row in result], ["__UNPARSED__"] * len(numbers))
+
+    def test_target_matching_falls_back_to_exact_source_filename(self):
+        function = extract_bash_function(ADDFILE, "target_file_matches_candidate")
+        cases = [
+            # Filename itself is not parseable as an episode, but it is the
+            # exact source filename and its size is checked by the caller.
+            ("Show release 15~4K.mp4", "", "S01E15", "Show release 15~4K.mp4", 0),
+            # Existing explicit parsing remains preferred and supported.
+            ("S01E15.mp4", "S01E15", "S01E15", "original-name.mp4", 0),
+            # Neither the expected episode nor exact source filename matches.
+            ("unrelated.mp4", "", "S01E15", "Show release 15~4K.mp4", 1),
+        ]
+        for target_name, target_episode, expected_episode, source_name, expected_rc in cases:
+            with self.subTest(target_name=target_name, expected_rc=expected_rc):
+                result = subprocess.run(
+                    [
+                        "bash", "-c",
+                        function + '\ntarget_file_matches_candidate "$1" "$2" "$3" "$4"\n',
+                        "target-file-match-test",
+                        target_name, target_episode, expected_episode, source_name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+
+    def test_missing_target_file_is_not_reported_as_success(self):
+        start = ADDFILE.index('warn "转存成功但目标目录暂时找不到')
+        end = ADDFILE.index('\n        fi', start)
+        failure_block = ADDFILE[start:end]
+        self.assertIn("task_failed=1", failure_block)
 
     def test_all_scanning_scripts_use_the_shared_sequence_inference(self):
         source_check = (ROOT / "source_check.sh").read_text(encoding="utf-8")
