@@ -222,6 +222,20 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
             ["S01E01", "S01E02", "S01E03", "S01E04", "S01E06"],
         )
 
+
+    def test_ignores_fps_numbers_with_separators_when_inferring_episodes(self):
+        samples = ((2, 24), (6, 30), (8, 48), (22, 60))
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token",
+             f"Series source {episode}~4K {fps}_fps.mp4", "mp4", ""]
+            for i, (episode, fps) in enumerate(samples)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual(
+            [row[0] for row in result],
+            [f"S01E{episode:02d}" for episode, _ in samples],
+        )
+
     def test_keeps_ambiguous_numeric_fields_unresolved(self):
         numbers = ((2, 11), (6, 14), (8, 16))
         rows = [
