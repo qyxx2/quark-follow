@@ -44,6 +44,7 @@
 set -u
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+EPISODE_SEQUENCE_PY="$BASE_DIR/episode_sequence.py"
 CONFIG="$BASE_DIR/config.local"
 RESOURCES_FILE="$BASE_DIR/resources.json"
 DB="$BASE_DIR/resource.db"
@@ -763,15 +764,23 @@ for n in r.iter():
         size="$raw_size"
         mtime="${raw_mtime:-}"
         key="$(parse_episode "$name" "$target" 2>/dev/null || true)"
-        [ -n "$key" ] || continue
+        [ -n "$key" ] || key="__UNPARSED__"
 
-        # WebDAV 缓存保留目标目录中所有可识别季度；
-        # 当前季度隔离只在 get_max_known_episode/get_missing_file/candidate
-        # 等计算阶段完成，不能在这里把其它季度从 webdav_files 中删掉。
-        [[ "$key" =~ ^S[0-9]{2}E[0-9]{2}$ ]] || continue
+        # Keep unparsed filenames until the full WebDAV directory has been read,
+        # so the shared sequence inference can compare their neighboring files.
+        [[ "$key" == "__UNPARSED__" || "$key" =~ ^S[0-9]{2}E[0-9]{2}$ ]] || continue
         printf '%s\t%s\t%s\t%s\n' "$key" "$name" "$size" "$mtime" >> "$output"
     done < "$raw"
 
+    if ! python3 "$EPISODE_SEQUENCE_PY" --format webdav --season "$season" "$output"; then
+        error "WebDAV集数序列推断失败：$target"
+        rm -f "$xml" "$raw" "$output"
+        return 1
+    fi
+
+    local inferred_output="$output.resolved"
+    awk -F '\t' '$1 != "__UNPARSED__" && $1 ~ /^S[0-9]{2}E[0-9]{2}$/' "$output" > "$inferred_output"
+    mv "$inferred_output" "$output"
     sort -u "$output" -o "$output" 2>/dev/null || true
     rm -f "$xml" "$raw"
     return 0
