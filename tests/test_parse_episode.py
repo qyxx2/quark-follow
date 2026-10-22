@@ -203,6 +203,25 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
             ["S01E02", "S01E06", "S01E08", "S01E22", "S01E24"],
         )
 
+
+    def test_single_unparsed_file_can_be_inferred_from_a_broad_anchor_sequence(self):
+        samples = [
+            ("S01E01", "EP01.mp4"),
+            ("S01E02", "EP02.mp4"),
+            ("S01E03", "EP03.mp4"),
+            ("S01E04", "EP04.mp4"),
+            ("__UNPARSED__", "Episode source 06~4K.mp4"),
+        ]
+        rows = [
+            [episode, "200000000", str(i), "token", filename, "mp4", ""]
+            for i, (episode, filename) in enumerate(samples)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual(
+            [row[0] for row in result],
+            ["S01E01", "S01E02", "S01E03", "S01E04", "S01E06"],
+        )
+
     def test_keeps_ambiguous_numeric_fields_unresolved(self):
         numbers = ((2, 11), (6, 14), (8, 16))
         rows = [
