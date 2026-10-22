@@ -165,6 +165,35 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         result = self.infer_rows(rows)
         self.assertEqual([row[0] for row in result], [f"S01E{n:02d}" for n in numbers])
 
+
+    def test_infers_when_episode_number_moves_between_numeric_positions(self):
+        samples = [
+            ("Series 02~4K.mp4", 2),
+            ("Series 03 filler Episode 06~4K.mp4", 6),
+            ("Series 08~4K.mp4", 8),
+            ("Series 22~4K.mp4", 22),
+            ("Series 24~4K.mp4", 24),
+        ]
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token", filename, "mp4", ""]
+            for i, (filename, _) in enumerate(samples)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual(
+            [row[0] for row in result],
+            [f"S01E{number:02d}" for _, number in samples],
+        )
+
+    def test_keeps_ambiguous_numeric_fields_unresolved(self):
+        numbers = ((2, 11), (6, 14), (8, 16))
+        rows = [
+            ["__UNPARSED__", "200000000", str(i), "token",
+             f"Series {first:02d} cut {second:02d}.mp4", "mp4", ""]
+            for i, (first, second) in enumerate(numbers)
+        ]
+        result = self.infer_rows(rows)
+        self.assertEqual([row[0] for row in result], ["__UNPARSED__"] * len(numbers))
+
     def test_does_not_infer_without_a_consistent_multi_file_sequence(self):
         filenames = ["Movie release 2024 4K.mp4", "Movie release 2025 4K.mp4"]
         rows = [
