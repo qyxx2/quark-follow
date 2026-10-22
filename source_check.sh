@@ -450,8 +450,10 @@ def candidate_tokens(filename):
             continue
 
         suffix = stem[match.end():]
-        # Short numbers attached to common quality/encoding metadata are not episodes.
-        if re.match(r"(?i)^(?:k|fps|hz|bit|p)\b", suffix) or re.match(r"(?i)^-bit\b", suffix):
+        suffix_token = re.sub(r"^[\s._~-]+", "", suffix)
+        # Exclude common quality/encoding tokens even when separated by punctuation:
+        # 4K, 60fps, 60_fps, 24-p, 10bit, and similar metadata.
+        if re.match(r"(?i)^(?:k|fps|hz|bit|p)\b", suffix_token):
             continue
 
         prefix = stem[:match.start()]
