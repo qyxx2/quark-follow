@@ -273,10 +273,15 @@ class ParseEpisodeRegressionTests(unittest.TestCase):
         self.assertEqual([row[0] for row in result], ["__UNPARSED__"] * len(numbers))
 
     def test_all_scanning_scripts_use_the_shared_sequence_inference(self):
-        for script_name in ("source_check.sh", "addfile.sh", "resource_check.sh"):
-            with self.subTest(script=script_name):
-                script = (ROOT / script_name).read_text(encoding="utf-8")
-                self.assertIn("episode_sequence.py", script)
+        source_check = (ROOT / "source_check.sh").read_text(encoding="utf-8")
+        addfile = (ROOT / "addfile.sh").read_text(encoding="utf-8")
+        resource_check = (ROOT / "resource_check.sh").read_text(encoding="utf-8")
+
+        self.assertIn('python3 "$EPISODE_SEQUENCE_PY" --season 1 "$scan_file"', source_check)
+        self.assertIn('[ -n "$key" ] || key="__UNPARSED__"', addfile)
+        self.assertIn('python3 "$EPISODE_SEQUENCE_PY" --season "$TASK_SEASON" "$existing_scan"', addfile)
+        self.assertIn('python3 "$EPISODE_SEQUENCE_PY" --season "$TASK_SEASON" "$share_file"', addfile)
+        self.assertIn('python3 "$EPISODE_SEQUENCE_PY" --format webdav --season "$season" "$output"', resource_check)
 
 
 if __name__ == "__main__":
