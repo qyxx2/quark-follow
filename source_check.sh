@@ -437,6 +437,10 @@ def natural_key(value):
         for part in re.split(r"(\d+)", value)
     )
 
+def episode_key(value):
+    match = re.fullmatch(r"S\d{2}E(\d{1,4})", value)
+    return int(match.group(1)) if match else None
+
 def candidate_tokens(filename):
     stem = filename.rsplit(".", 1)[0]
     candidates = []
@@ -458,7 +462,6 @@ def candidate_tokens(filename):
         labeled_after = re.match(r"\s*(?:集|话|回|期)", suffix) is not None
         candidates.append((value, labeled_before or labeled_after))
 
-    # A file can contain the same short number more than once; keep its strongest context.
     by_value = {}
     for value, labeled in candidates:
         by_value[value] = by_value.get(value, False) or labeled
@@ -471,7 +474,10 @@ token_rows = {
 }
 
 def state_score(path, label_votes):
-    return (len(path), len({value for _, value in path}), label_votes)
+    unknown_count = sum(1 for _, _, is_unknown in path if is_unknown)
+    anchor_count = len(path) - unknown_count
+    distinct_count = len({value for _, value, _ in path})
+    return (unknown_count, anchor_count, distinct_count, label_votes)
 
 def offer_state(states, last_value, path, label_votes):
     candidate = (path, label_votes)
@@ -492,7 +498,15 @@ def offer_state(states, last_value, path, label_votes):
 def infer_direction(ordered, direction, minimum_coverage):
     states = {}
     for index in ordered:
-        options = token_rows.get(index, [])
+        known_episode = episode_key(rows[index][0])
+        if rows[index][0] != marker and known_episode is not None:
+            options = [(known_episode, False, False)]
+        else:
+            options = [
+                (value, labeled, True)
+                for value, labeled in token_rows.get(index, [])
+            ]
+
         previous_states = [
             (last_value, path, labels)
             for last_value, bucket in states.items()
@@ -500,8 +514,8 @@ def infer_direction(ordered, direction, minimum_coverage):
         ]
         next_states = {last_value: list(bucket) for last_value, bucket in states.items()}
 
-        for value, labeled in options:
-            offer_state(next_states, value, ((index, value),), int(labeled))
+        for value, labeled, is_unknown in options:
+            offer_state(next_states, value, ((index, value, is_unknown),), int(labeled))
             for last_value, path, labels in previous_states:
                 follows_order = (
                     last_value <= value if direction == "ascending"
@@ -511,7 +525,7 @@ def infer_direction(ordered, direction, minimum_coverage):
                     offer_state(
                         next_states,
                         value,
-                        path + ((index, value),),
+                        path + ((index, value, is_unknown),),
                         labels + int(labeled),
                     )
         states = next_states
@@ -520,22 +534,23 @@ def infer_direction(ordered, direction, minimum_coverage):
     for bucket in states.values():
         for path, labels in bucket:
             score = state_score(path, labels)
-            if len(path) >= minimum_coverage and score[1] >= 3:
-                eligible.append((score, path))
+            if score[0] >= minimum_coverage and score[2] >= 3:
+                inferred = tuple((index, value) for index, value, is_unknown in path if is_unknown)
+                eligible.append((score, inferred))
 
     if not eligible:
         return None
 
     best_score = max(score for score, _ in eligible)
-    best_paths = [
-        path for score, path in eligible
+    best_mappings = [
+        mapping for score, mapping in eligible
         if score == best_score
     ]
-    signatures = {tuple(sorted(path)) for path in best_paths}
+    signatures = {tuple(sorted(mapping)) for mapping in best_mappings}
     if len(signatures) != 1:
         return None
 
-    return best_score, dict(best_paths[0])
+    return best_score, dict(best_mappings[0])
 
 def infer_group(indices, sort_by_path=False):
     unresolved = [index for index in indices if rows[index][0] == marker]
@@ -543,13 +558,13 @@ def infer_group(indices, sort_by_path=False):
         return
 
     ordered = sorted(
-        unresolved,
+        indices,
         key=lambda index: natural_key(
             (rows[index][6] + "/" if sort_by_path and rows[index][6] else "")
             + rows[index][4]
         ),
     )
-    minimum_coverage = max(3, (len(ordered) + 1) // 2)
+    minimum_coverage = max(3, (len(unresolved) + 1) // 2)
     options = [
         infer_direction(ordered, direction, minimum_coverage)
         for direction in ("ascending", "descending")
