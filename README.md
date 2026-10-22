@@ -2,6 +2,12 @@
 
 用于自动跟踪 SeedHub 影视资源，并将可用的夸克分享补入 OpenList / WebDAV 目标目录。
 
+## 1.0.1 更新
+
+- 资源检查前支持强制刷新已跟踪的 Share 状态，并保留显式排除规则。
+- 新增共享集数序列推断，让分享扫描、转存和 WebDAV 检查采用一致规则；转存后无法定位目标文件时会明确报告失败。
+- Web 管理页顶部新增 OpenList 全局入口，地址读取配置项 `OPENLIST_URL`。
+
 核心流程：
 
 ```text
@@ -51,6 +57,7 @@ resource_check.sh
 | `seedhub_cache.sh` | 调用 SeedHub Playwright 容器 |
 | `docker/seedhub_cache.py` | SeedHub 页面解析与 Share 入口缓存 |
 | `source_check.sh` | 扫描 Share 内容并更新 `share_files` |
+| `episode_sequence.py` | 分享扫描、转存和 WebDAV 检查共用的集数序列推断 |
 | `addfile.sh` | 执行夸克转存、刷新和文件重命名 |
 | `replace.sh` | 执行 `replace_queue` 中的替换任务 |
 | `stoken_cache.sh` | 多个 Quark 脚本共享的 stoken 缓存 |
@@ -179,7 +186,7 @@ python3 web_app.py
 http://<NAS-IP>:5233
 ```
 
-Web 页面提供资源状态、Share 详情、任务控制、手动资源管理、日志筛选、API 调用统计、SeedHub 容器管理和受限配置编辑。
+Web 页面提供资源状态、Share 详情、任务控制、手动资源管理、日志筛选、API 调用统计、SeedHub 容器管理、受限配置编辑，以及按 `OPENLIST_URL` 显示的全局 OpenList 入口。
 
 ## 数据与日志
 
