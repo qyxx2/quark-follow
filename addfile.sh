@@ -819,6 +819,22 @@ quark_target_list() {
 
 
 # ============================================================
+# 转存后目标文件匹配
+# ============================================================
+
+target_file_matches_candidate() {
+    local target_name="$1"
+    local target_episode="$2"
+    local expected_episode="$3"
+    local source_name="$4"
+
+    # Prefer the parsed episode when available, but preserve the source-name
+    # fallback for filenames whose episode was inferred from the source sequence.
+    [ "$target_episode" = "$expected_episode" ] || [ "$target_name" = "$source_name" ]
+}
+
+
+# ============================================================
 # Quark：重命名
 # ============================================================
 
@@ -1373,7 +1389,7 @@ process_task() {
 
             qkey="$(parse_episode "$qname" "$target" || true)"
 
-            if [ "$qkey" = "$key" ]; then
+            if target_file_matches_candidate "$qname" "$qkey" "$key" "$filename"; then
 
                 found_fid="$qfid"
                 found_name="$qname"
@@ -1387,7 +1403,8 @@ process_task() {
 
         if [ -z "$found_fid" ]; then
 
-            warn "转存成功但目标目录暂时找不到：$task_name $key source=$share"
+            warn "转存成功但目标目录暂时找不到：$task_name $key source=$share filename=$filename size=$size"
+            task_failed=1
 
             continue
         fi
