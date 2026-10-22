@@ -1105,20 +1105,16 @@ source_check_share() {
     return 0
 }
 
-scan_unchecked_front20_shares() {
-    local show_id="$1" show_name="$2" output="$3" sid
-    sqlite3 "$DB" \
-        "SELECT s.id FROM shares s WHERE s.show_id=$(sql_quote "$show_id") AND s.pool_type='front20' AND s.status='unknown' ORDER BY COALESCE(s.seedhub_rank,999999),s.id;" \
-        > "$output"
+force_refresh_shares() {
+    local show_name="$1" show_id="$2"
 
-    while IFS= read -r sid; do
-        [ -n "$sid" ] || continue
-        if source_check_share "$show_name" "$sid"; then
-            info "[$show_name] 前20未扫描 Share 已检查：share_id=$sid"
-        else
-            warn "[$show_name] 前20未扫描 Share 检查失败：share_id=$sid"
-        fi
-    done < "$output"
+    info "[$show_name] 强制刷新该资源的全部夸克分享，忽略缓存时效和每轮扫描上限：show_id=$show_id"
+    if ! bash "$SOURCE_CHECK_SH" --show-id "$show_id" --force >> "$LOG_FILE" 2>&1; then
+        warn "[$show_name] 强制刷新分享时有失败项：show_id=$show_id；请查看 source_check.log 和 resource_check.log"
+        return 1
+    fi
+    info "[$show_name] 全部已登记夸克分享刷新流程结束：show_id=$show_id"
+    return 0
 }
 
 recheck_pending_shares() {
@@ -1474,7 +1470,7 @@ process_resource() {
     RESOURCE_RESULT="FAILED"
     WEBDAV_STATE_VALID=0
     local show_id resource_name total current_path target old_rank
-    local webdav_file missing_file candidate_file selected_file recheck_file
+    local webdav_file missing_file candidate_file selected_file
     local missing_count_val unresolved
     local status='UNRESOLVED'
     local add_rc=0
@@ -1527,15 +1523,13 @@ process_resource() {
         return 1
     fi
 
-    # SeedHub cache 只维护前20入口；这里只扫描其中尚未建立 share_files 的新 Share。
-    local initial_unchecked="$TMP_ROOT/initial-unchecked-${show_id}.txt"
-    scan_unchecked_front20_shares "$show_id" "$resource_name" "$initial_unchecked"
+    # 每次资源检查都按分享当前内容重建缓存，不依赖缓存时效、Share 状态或每轮数量上限。
+    force_refresh_shares "$resource_name" "$show_id" || true
 
     webdav_file="$TMP_ROOT/webdav-${show_id}.tsv"
     missing_file="$TMP_ROOT/missing-${show_id}.txt"
     candidate_file="$TMP_ROOT/candidates-${show_id}.tsv"
     selected_file="$TMP_ROOT/selected-${show_id}.tsv"
-    recheck_file="$TMP_ROOT/recheck-${show_id}.txt"
 
     if ! scan_webdav_actual "$target" "$webdav_file"; then
         WEBDAV_STATE_VALID=0
@@ -1563,37 +1557,7 @@ process_resource() {
     # 此时本轮只能判断 E01-E14 是否完整，E15-E18 属于“尚未发现资源”，
     # 不能错误地称为 WebDAV 缺失并无限等待。
     # --------------------------------------------------------
-    # Pending 空 Share 只在到期后重扫；一次最多 RESOURCE_RECHECK_EXISTING_MAX 个。
-    recheck_pending_shares "$show_id" "$recheck_file"
-    if [ -s "$recheck_file" ]; then
-        while IFS= read -r sid; do
-            [ -n "$sid" ] || continue
-            if source_check_share "$resource_name" "$sid"; then
-                info "[$resource_name] 到期 Pending Share 已重扫：share_id=$sid"
-            else
-                warn "[$resource_name] 到期 Pending Share 重扫失败：share_id=$sid"
-            fi
-        done < "$recheck_file"
-    fi
-
     known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
-
-    # 如果数据库已有 Share 但缓存为空，先有限重新验证；不能因为 total=18
-    # 就人为制造 E01-E18 的 missing_file。
-    if [ "$known_max" -eq 0 ] && [ "$RESOURCE_RECHECK_EXISTING_MAX" -gt 0 ]; then
-        recheck_existing_shares "$show_id" "$recheck_file"
-        if [ -s "$recheck_file" ]; then
-            while IFS= read -r sid; do
-                [ -n "$sid" ] || continue
-                if source_check_share "$resource_name" "$sid"; then
-                    known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
-                    [ "$known_max" -gt 0 ] && break
-                else
-                    warn "[$resource_name] 跳过失败的旧 Share：share_id=$sid"
-                fi
-            done < "$recheck_file"
-        fi
-    fi
 
     # 当前仍完全没有可识别剧集时，才进行 SeedHub 增量发现。
     if [ "$known_max" -eq 0 ]; then
@@ -1634,32 +1598,6 @@ process_resource() {
     select_task_shares "$show_id" "$candidate_file" "$missing_file" "$selected_file"
     unresolved="$(count_unresolved "$missing_file" "$candidate_file")"
     info "[$resource_name] 当前资源范围内 share_files 仍有 $unresolved 集没有候选"
-
-    # --------------------------------------------------------
-    # 2. 只重新验证少量过期/没有缓存的旧 Share
-    # --------------------------------------------------------
-    if [ "$unresolved" -gt 0 ] && [ "$RESOURCE_RECHECK_EXISTING_MAX" -gt 0 ]; then
-        recheck_existing_shares "$show_id" "$recheck_file"
-        if [ -s "$recheck_file" ]; then
-            while IFS= read -r sid; do
-                [ -n "$sid" ] || continue
-                if source_check_share "$resource_name" "$sid"; then
-                    # source_check 可能发现更高的集数，所以重新确定范围。
-                    known_max="$(get_max_known_episode "$show_id" "$webdav_file")"
-                    [ "$known_max" -gt "$total" ] && known_max="$total"
-                    get_missing_file "$known_max" "$missing_file"
-                    build_candidates "$show_id" "$missing_file" "$candidate_file"
-                    unresolved="$(count_unresolved "$missing_file" "$candidate_file")"
-                    if [ "$unresolved" -eq 0 ]; then
-                        info "[$resource_name] 重新验证旧 Share 后，当前已发现范围全部具备候选"
-                        break
-                    fi
-                else
-                    warn "[$resource_name] 跳过失败的旧 Share：share_id=$sid"
-                fi
-            done < "$recheck_file"
-        fi
-    fi
 
     # --------------------------------------------------------
     # 3. 缓存仍不够 -> SeedHub 增量发现

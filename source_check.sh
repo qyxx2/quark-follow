@@ -586,6 +586,25 @@ mark_share_failure() {
     local current_status
     current_status="$(sqlite3 "$DB" "SELECT COALESCE(status,'unknown') FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
 
+    [ "$current_status" != "excluded" ] || return 0
+
+    if [ "$FORCE_REFRESH" = true ]; then
+        # A forced refresh that cannot reach Quark must not leave stale cache marked usable.
+        # Keep share_files for diagnosis/recovery, but exclude it from candidate selection.
+        sqlite3 "$DB" <<SQL
+PRAGMA busy_timeout=10000;
+UPDATE shares
+   SET status='pending',
+       fail_count=0,
+       last_check=CURRENT_TIMESTAMP,
+       last_success=NULL,
+       updated_at=CURRENT_TIMESTAMP
+ WHERE id=$(sql_quote "$share_id") AND status!='excluded';
+SQL
+        log "SOURCE强制刷新失败：share_id=$share_id；保留旧 share_files 以便恢复，但不再作为有效候选：url=$(sqlite3 "$DB" "SELECT url FROM shares WHERE id=$(sql_quote "$share_id") LIMIT 1;")"
+        return 0
+    fi
+
     # Pending 的失败不是“第几次空目录”；不消耗三次机会，也不进入 dead。
     if [ "$current_status" = "pending" ]; then
         sqlite3 "$DB" "UPDATE shares SET last_check=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=$(sql_quote "$share_id");"
@@ -823,6 +842,7 @@ process_share() {
 
 MODE="all"
 TARGET_ID=""
+FORCE_REFRESH=false
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -830,6 +850,7 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || { echo "ERROR: --share-id 缺少参数" >&2; exit 2; }
             MODE="share"
             TARGET_ID="$2"
+            FORCE_REFRESH=true
             shift 2
             ;;
         --show-id)
@@ -838,12 +859,17 @@ while [ "$#" -gt 0 ]; do
             TARGET_ID="$2"
             shift 2
             ;;
+        --force)
+            FORCE_REFRESH=true
+            shift
+            ;;
         -h|--help)
             cat <<HELP
 用法：
   ./source_check.sh                 扫描所有 status != dead 的分享
   ./source_check.sh --share-id 3   只扫描 shares.id=3
   ./source_check.sh --show-id 1    只扫描指定剧集的非 dead 分享
+  ./source_check.sh --show-id 1 --force  忽略 dead 状态，立即刷新该剧所有未排除分享
 
 说明：
   - 成功扫描后才替换该 share 的 share_files 缓存
@@ -864,12 +890,14 @@ SHARE_LIST="$TMP_ROOT/share_list.tsv"
 
 case "$MODE" in
     all)
-        sqlite3 -tabs "$DB" <<'SQL' > "$SHARE_LIST"
-SELECT id, show_id, url, seedhub_rank, status
-  FROM shares
- WHERE COALESCE(status,'unknown') NOT IN ('dead','excluded')
- ORDER BY show_id, seedhub_rank, id;
-SQL
+        if [ "$FORCE_REFRESH" = true ]; then
+            status_filter="COALESCE(status,'unknown')!='excluded'"
+        else
+            status_filter="COALESCE(status,'unknown') NOT IN ('dead','excluded')"
+        fi
+        sqlite3 -tabs "$DB" \
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE $status_filter ORDER BY show_id, seedhub_rank, id;" \
+            > "$SHARE_LIST"
         ;;
 
     share)
@@ -879,10 +907,16 @@ SQL
         ;;
 
     show)
+        if [ "$FORCE_REFRESH" = true ]; then
+            status_filter="COALESCE(status,'unknown')!='excluded'"
+        else
+            status_filter="COALESCE(status,'unknown') NOT IN ('dead','excluded')"
+        fi
         sqlite3 -tabs "$DB" \
-            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE show_id=$(sql_quote "$TARGET_ID") AND COALESCE(status,'unknown') NOT IN ('dead','excluded') ORDER BY seedhub_rank, id;" \
+            "SELECT id, show_id, url, seedhub_rank, status FROM shares WHERE show_id=$(sql_quote "$TARGET_ID") AND $status_filter ORDER BY seedhub_rank, id;" \
             > "$SHARE_LIST"
         ;;
+
 esac
 
 if [ ! -s "$SHARE_LIST" ]; then
